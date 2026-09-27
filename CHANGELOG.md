@@ -13,6 +13,11 @@ published measurements were taken on.
 
 ### Added
 
+- A Tetris demo, `scripts/unridden/play_tetris.py`: Unridden picks every
+  placement through `/v2` Choice questions, with heuristic and random
+  baselines, a `--trace` JSONL log, and `tetris_replay.html` to step through a
+  recorded game. Results in `docs/results/tetris-demo.md`.
+
 - Experimental Rider mode, `POST /v2/rider` (with `--snapshots`): greedy text
   generation that continues from a saved snapshot on the split runtime without
   re-prefilling the snapshot prefix (ADR 0007, named in ADR 0008). The snapshot
