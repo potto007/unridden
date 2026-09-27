@@ -1,0 +1,448 @@
+<title>Unridden Tetris Replay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #eef1f4;
+  --panel: #f9fafb;
+  --ink: #16202b;
+  --muted: #5b6876;
+  --faint: #d5dbe2;
+  --grid: #e3e8ee;
+  --well: #1b2531;
+  --well-grid: #26323f;
+  --accent: #2f5bd3;
+  --accent-soft: #dce4fa;
+  --heur: #b86a12;
+  --heur-soft: #f6e6d2;
+  --bad: #b3261e;
+  --good: #1f7a4a;
+  --I: #3aa6c9; --O: #d9b22b; --T: #9a5cc6; --S: #4caf62; --Z: #d4574b; --J: #3f6fd1; --L: #e08a31;
+  --sans: "Chivo", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #10161d; --panel: #161e27; --ink: #e4e9ef; --muted: #93a0ae;
+    --faint: #2b3643; --grid: #1f2934; --well: #0b1016; --well-grid: #18212b;
+    --accent: #7d9bf0; --accent-soft: #1f2c4d; --heur: #e0a15a; --heur-soft: #3a2a17;
+    --bad: #f07a70; --good: #5fcf8f;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #10161d; --panel: #161e27; --ink: #e4e9ef; --muted: #93a0ae;
+  --faint: #2b3643; --grid: #1f2934; --well: #0b1016; --well-grid: #18212b;
+  --accent: #7d9bf0; --accent-soft: #1f2c4d; --heur: #e0a15a; --heur-soft: #3a2a17;
+  --bad: #f07a70; --good: #5fcf8f;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.45; padding-inline: 16px; padding-block: 20px 40px; }
+.wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; }
+h1 { font-size: 22px; font-weight: 800; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h1 span { color: var(--muted); font-weight: 400; }
+.sub { color: var(--muted); max-width: 70ch; margin: 0; }
+h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tab { font: 600 12px var(--mono); border: 1px solid var(--faint); background: var(--panel); color: var(--ink); padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+.tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tab:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 22px; font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stats b { color: var(--ink); font-weight: 600; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+.pill.over { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+.pill.alive { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+.main { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 760px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.boardcol { display: flex; flex-direction: column; gap: 10px; }
+canvas#board { width: 100%; max-width: 300px; aspect-ratio: 1 / 2; background: var(--well); border-radius: 4px; display: block; }
+.moveline { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; display: flex; flex-direction: column; gap: 2px; }
+.moveline .big { font-size: 15px; font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--faint); border-radius: 8px; padding: 14px; min-width: 0; }
+.transport { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.transport button { font: 600 12px var(--mono); background: var(--panel); color: var(--ink); border: 1px solid var(--faint); border-radius: 6px; padding: 6px 10px; cursor: pointer; min-width: 36px; }
+.transport button.primary { background: var(--accent); color: #fff; border-color: var(--accent); min-width: 72px; }
+.transport input[type=range] { flex: 1 1 200px; accent-color: var(--accent); }
+.transport select { font: 12px var(--mono); background: var(--panel); color: var(--ink); border: 1px solid var(--faint); border-radius: 6px; padding: 5px; }
+.transport .pos { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; min-width: 9ch; text-align: right; }
+canvas#spark { width: 100%; height: 64px; display: block; cursor: pointer; }
+.rightcol { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.rounds { display: flex; flex-direction: column; gap: 14px; }
+.round h3 { font: 600 12px var(--mono); margin: 0 0 6px; color: var(--ink); }
+.round h3 span { color: var(--muted); font-weight: 400; }
+.cands { display: flex; flex-direction: column; gap: 2px; }
+.cand { display: grid; grid-template-columns: 7ch minmax(0, 1fr) minmax(90px, 32%) 8ch; gap: 8px; align-items: center; font: 12px var(--mono); padding: 3px 6px; border-radius: 4px; cursor: default; font-variant-numeric: tabular-nums; }
+.cand:hover, .cand.hover { background: var(--grid); }
+.cand.picked { background: var(--accent-soft); }
+.cand .key { font-weight: 600; }
+.cand .bar { position: relative; height: 16px; min-width: 0; }
+.cand .bar i { position: absolute; left: 0; top: 3px; bottom: 3px; background: var(--muted); opacity: .45; border-radius: 2px; }
+.cand.picked .bar i { background: var(--accent); opacity: 1; }
+.cand .desc { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.cand.picked .desc { color: var(--ink); }
+.cand .bar { background: var(--grid); border-radius: 2px; }
+.cand .val { text-align: right; color: var(--muted); }
+.cand .tag { font-size: 10px; font-weight: 600; padding: 0 4px; border-radius: 3px; margin-left: 4px; }
+.tag.h { background: var(--heur-soft); color: var(--heur); }
+.more { font: 11px var(--mono); color: var(--muted); background: none; border: none; padding: 4px 6px; cursor: pointer; text-align: left; }
+.axis { display: grid; grid-template-columns: 7ch minmax(0, 1fr) minmax(90px, 32%) 8ch; gap: 8px; font: 10px var(--mono); color: var(--muted); padding: 0 6px; }
+.axis div { display: flex; justify-content: space-between; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 10px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+details.ex { border-top: 1px solid var(--faint); padding-block: 8px; }
+details.ex:first-of-type { border-top: none; }
+details.ex summary { font: 12px var(--mono); cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+details.ex summary .m { font-weight: 600; color: var(--accent); }
+details.ex summary .ms { color: var(--muted); margin-left: auto; }
+.jsonbox { overflow: auto; max-height: 420px; background: var(--bg); border-radius: 6px; padding: 10px; margin-top: 8px; }
+.jsonbox pre { margin: 0; font: 11.5px/1.5 var(--mono); white-space: pre; }
+.prompt { white-space: pre-wrap; }
+.note { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.loadrow { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); }
+.loadrow input { font-size: 12px; max-width: 100%; }
+.status { font: 12px var(--mono); color: var(--muted); }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Unridden Tetris <span>replay</span></h1>
+      <p class="sub">Each move, the engine enumerates every hard-drop placement and Unridden picks one by reading label logits after the prefill. No tokens are generated. Step through a game to see the distribution it read and the exact HTTP exchange behind each drop.</p>
+    </div>
+  </header>
+
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div class="stats" id="stats"><span class="status" id="status">Loading trace...</span></div>
+
+  <div class="main">
+    <div class="boardcol">
+      <canvas id="board" width="300" height="600" aria-label="Tetris board"></canvas>
+      <div class="moveline" id="moveline"></div>
+    </div>
+    <div class="rightcol">
+      <div class="panel">
+        <div class="transport">
+          <button id="first" title="First move (Home)">|&lt;</button>
+          <button id="prev" title="Previous move (Left)">&lt;</button>
+          <button id="play" class="primary" title="Play or pause (Space)">Play</button>
+          <button id="next" title="Next move (Right)">&gt;</button>
+          <button id="last" title="Last move (End)">&gt;|</button>
+          <select id="speed" aria-label="Playback speed">
+            <option value="1400">0.5x</option>
+            <option value="700" selected>1x</option>
+            <option value="300">2x</option>
+            <option value="100">6x</option>
+            <option value="30">20x</option>
+          </select>
+          <input type="range" id="scrub" min="0" max="0" value="0" aria-label="Move">
+          <span class="pos" id="pos">0 / 0</span>
+        </div>
+        <canvas id="spark" width="800" height="64" aria-label="Lines cleared and stack height over the game"></canvas>
+        <div class="legend">
+          <span><i style="background:var(--accent)"></i>lines cleared (cumulative)</span>
+          <span><i style="background:var(--heur)"></i>stack height</span>
+          <span><i style="background:var(--bad)"></i>holes</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2 id="decisionTitle">Decision</h2>
+        <div class="rounds" id="rounds"></div>
+        <p class="note" id="decisionNote"></p>
+      </div>
+
+      <div class="panel">
+        <h2>HTTP exchanges for this move</h2>
+        <div id="exchanges"></div>
+      </div>
+
+      <div class="panel loadrow">
+        <label for="file">Open a trace (JSONL from <code>play_tetris.py --trace</code>):</label>
+        <input type="file" id="file" accept=".jsonl,.json,application/json">
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Traces listed here load on open when the page is served over HTTP next to a
+// traces/ directory (for example `python -m http.server` from this folder).
+// Opened straight from disk, use the file picker instead.
+const TRACES = [
+  // { file: "traces/choice-seed0.jsonl", label: "choice / seed 0" },
+];
+
+const $ = id => document.getElementById(id);
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+let game = null, moves = [], result = null, idx = 0, playing = false, timer = null, hoverKey = null, anim = 1, animStart = 0;
+const cache = new Map();
+
+function parseJsonl(text) {
+  const rows = [];
+  for (const line of text.split("\n")) { if (line.trim()) { try { rows.push(JSON.parse(line)); } catch (e) {} } }
+  return rows;
+}
+
+function load(rows, label) {
+  game = rows.find(r => r.type === "game") || {};
+  moves = rows.filter(r => r.type === "move");
+  result = rows.find(r => r.type === "result") || null;
+  idx = 0; stop();
+  $("scrub").max = Math.max(0, moves.length - 1);
+  renderStats(label);
+  drawSpark();
+  show(0, false);
+}
+
+async function openTrace(i) {
+  document.querySelectorAll(".tab").forEach((t, j) => t.setAttribute("aria-selected", String(j === i)));
+  const t = TRACES[i];
+  if (cache.has(t.file)) { load(cache.get(t.file), t.label); return; }
+  $("stats").innerHTML = `<span class="status">Loading ${t.label}...</span>`;
+  try {
+    const res = await fetch(t.file);
+    if (!res.ok) throw new Error(res.status);
+    const rows = parseJsonl(await res.text());
+    cache.set(t.file, rows);
+    load(rows, t.label);
+  } catch (e) {
+    $("stats").innerHTML = `<span class="status">Could not load ${t.file} (${e.message}). Open a trace file below instead.</span>`;
+  }
+}
+
+function renderStats(label) {
+  const n = moves.length;
+  const agentName = game.agent === "score" ? (game.hints ? "score + outcome hints" : "score, board only") : game.agent;
+  const lines = n ? moves[n - 1].lines_total : 0;
+  const agree = n ? moves.filter(m => m.pick === m.heuristic_pick).length / n : 0;
+  const ms = n ? moves.reduce((a, m) => a + (m.ms || 0), 0) / n : 0;
+  const over = result ? result.topped_out : null;
+  const status = over === null ? `<span class="pill">incomplete</span>` : over ? `<span class="pill over">topped out</span>` : `<span class="pill alive">survived ${game.max_pieces}</span>`;
+  $("stats").innerHTML = [
+    `agent <b>${agentName}</b>`, `seed <b>${game.seed ?? "?"}</b>`,
+    `pieces <b>${n}</b>`, `lines <b>${lines}</b>`, status,
+    `matches heuristic <b>${(agree * 100).toFixed(1)}%</b>`,
+    `model time <b>${ms.toFixed(0)} ms</b>/move`,
+    result && result.input_tokens ? `prefill <b>${(result.input_tokens / 1000).toFixed(0)}k</b> tokens, <b>0</b> generated` : "",
+  ].filter(Boolean).map(s => `<span>${s}</span>`).join("");
+}
+
+// ---------- board ----------
+const board = $("board"), bctx = board.getContext("2d");
+function fitCanvas(c, ctx) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return { w, h, dpr };
+}
+
+function cell(ctx, x, y, s, color, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.fillRect(x * s + 1, y * s + 1, s - 2, s - 2);
+  ctx.globalAlpha = alpha * 0.25;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(x * s + 1, y * s + 1, s - 2, Math.max(2, s * 0.14));
+  ctx.globalAlpha = 1;
+}
+
+function drawBoard() {
+  const { w, h } = fitCanvas(board, bctx);
+  const W = game.width || 10, H = game.height || 20, s = Math.min(w / W, h / H);
+  bctx.fillStyle = css("--well"); bctx.fillRect(0, 0, w, h);
+  bctx.strokeStyle = css("--well-grid"); bctx.lineWidth = 1;
+  for (let x = 1; x < W; x++) { bctx.beginPath(); bctx.moveTo(x * s + .5, 0); bctx.lineTo(x * s + .5, H * s); bctx.stroke(); }
+  for (let y = 1; y < H; y++) { bctx.beginPath(); bctx.moveTo(0, y * s + .5); bctx.lineTo(W * s, y * s + .5); bctx.stroke(); }
+  const m = moves[idx];
+  if (!m) return;
+  const pc = css("--" + m.piece);
+  if (anim < 1) {
+    // falling phase: before-board plus the picked piece dropping into place
+    m.board_before.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch)); }));
+    const pick = m.candidates.find(c => c.key === m.pick);
+    const minR = Math.min(...pick.cells.map(c => c[0]));
+    const t = Math.min(1, anim / 0.75), ease = t * t;
+    const off = (1 - ease) * minR;
+    pick.cells.forEach(([r, c]) => cell(bctx, c, r - off, s, pc));
+  } else {
+    m.board_after.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch)); }));
+  }
+  if (hoverKey) {
+    const hc = m.candidates.find(c => c.key === hoverKey);
+    if (hc) {
+      bctx.fillStyle = "rgba(0,0,0,0.35)"; bctx.fillRect(0, 0, w, h);
+      m.board_before.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch), 0.55); }));
+      hc.cells.forEach(([r, c]) => { cell(bctx, c, r, s, pc); bctx.strokeStyle = "#fff"; bctx.lineWidth = 2; bctx.strokeRect(c * s + 1, r * s + 1, s - 2, s - 2); });
+    }
+  }
+}
+
+function tick(now) {
+  if (anim >= 1) return;
+  const dur = Math.min(450, +$("speed").value * 0.6);
+  anim = Math.min(1, (now - animStart) / dur);
+  drawBoard();
+  if (anim < 1) requestAnimationFrame(tick);
+}
+
+// ---------- decision panel ----------
+const fmtP = p => p >= 0.001 ? p.toFixed(4) : p.toExponential(1);
+function candRow(m, c, value, width, text) {
+  const tags = (c.key === m.heuristic_pick ? `<span class="tag h">H</span>` : "");
+  return `<div class="cand${c.key === m.pick ? " picked" : ""}" data-key="${c.key}">
+    <span class="key">${c.key}${tags}</span>
+    <span class="desc" title="${text}">${text}</span><span class="bar"><i style="width:${(width * 100).toFixed(2)}%"></i></span>
+    <span class="val">${value}</span></div>`;
+}
+
+function renderDecision(m) {
+  const byKey = Object.fromEntries(m.candidates.map(c => [c.key, c]));
+  const d = m.detail || {};
+  let html = "";
+  const short = c => c.description.replace(/^rotation \d+, /, "");
+  if (d.rounds) {
+    $("decisionTitle").textContent = "Choice readout, log10 P over the offered placements";
+    const LO = -12;
+    d.rounds.forEach(r => {
+      const rows = r.options.map(k => ({ c: byKey[k], p: r.probabilities[k] })).sort((a, b) => b.p - a.p);
+      const title = r.name === "final" ? "Final" : d.rounds.length > 1 ? `Group ${r.name.slice(1) * 1 + 1}` : "All placements";
+      const top = rows.slice(0, 8), rest = rows.slice(8);
+      const row = x => candRow(m, x.c, fmtP(x.p), Math.max(0, (Math.log10(Math.max(x.p, 1e-300)) - LO) / -LO), short(x.c));
+      html += `<div class="round"><h3>${title} <span>${rows.length} options, picked ${r.choice}</span></h3>
+        <div class="axis"><span></span><span></span><div><span>1e${LO}</span><span>1e-6</span><span>1</span></div><span></span></div>
+        <div class="cands">${top.map(row).join("")}${rest.length ? `<div hidden>${rest.map(row).join("")}</div><button class="more">show ${rest.length} more</button>` : ""}</div></div>`;
+    });
+    $("decisionNote").textContent = m.candidates.length > 26
+      ? `${m.candidates.length} placements exceed the 26-label alphabet, so they ran as two independent Choice questions and the two winners met in a final. H marks the fixed heuristic's pick.`
+      : "One Choice question over every distinct placement. H marks the fixed heuristic's pick.";
+  } else if (d.scores) {
+    $("decisionTitle").textContent = "Score readout, expected level per placement (0 terrible to 4 excellent)";
+    const rows = m.candidates.map(c => ({ c, s: d.scores[c.key] })).sort((a, b) => b.s - a.s);
+    const top = rows.slice(0, 10), rest = rows.slice(10);
+    const row = x => candRow(m, x.c, x.s.toFixed(3), x.s / 4, short(x.c));
+    html = `<div class="round"><h3>${rows.length} Score questions <span>one per placement, argmax of E[level]</span></h3>
+      <div class="axis"><span></span><span></span><div><span>terrible</span><span>mediocre</span><span>excellent</span></div><span></span></div>
+      <div class="cands">${top.map(row).join("")}${rest.length ? `<div hidden>${rest.map(row).join("")}</div><button class="more">show ${rest.length} more</button>` : ""}</div></div>`;
+    $("decisionNote").textContent = game.hints
+      ? "Each question shows the board with the candidate drawn as '@' plus a one-line outcome summary. H marks the fixed heuristic's pick."
+      : "Each question shows only the board with the candidate drawn as '@'; no computed stats. H marks the fixed heuristic's pick.";
+  } else {
+    $("decisionTitle").textContent = "Decision";
+    html = `<p class="note">${m.note === "forced" ? "Only one legal placement was left, so the model was not asked." : "This agent does not call the model."}</p>`;
+    $("decisionNote").textContent = "";
+  }
+  $("rounds").innerHTML = html;
+  $("rounds").querySelectorAll(".more").forEach(b => b.addEventListener("click", () => { b.previousElementSibling.hidden = false; b.remove(); }));
+}
+
+// ---------- exchanges ----------
+const esc = s => String(s).replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
+function renderExchanges(m) {
+  const ex = m.exchanges || [];
+  if (!ex.length) { $("exchanges").innerHTML = `<p class="note">No model calls.</p>`; return; }
+  $("exchanges").innerHTML = ex.map((e, i) => {
+    const what = e.path === "/v2/snapshots" ? "prefill the board as a context snapshot"
+      : e.path === "/v2/decisions" ? `${Object.keys(e.request.questions).length} question(s) branch from the snapshot`
+      : e.method === "DELETE" ? "drop the snapshot" : "";
+    let body = "";
+    if (e.request && e.request.input && typeof e.request.input.state === "string") {
+      const { state, ...restInput } = e.request.input;
+      body += `<h2 style="margin-top:4px">State text (shared prefix)</h2><pre class="prompt">${esc(state)}</pre><h2 style="margin-top:12px">Request</h2><pre>${esc(JSON.stringify({ ...e.request, input: { ...restInput, state: "(shown above)" } }, null, 2))}</pre>`;
+    } else if (e.request) {
+      body += `<h2 style="margin-top:4px">Request</h2><pre>${esc(JSON.stringify(e.request, null, 2))}</pre>`;
+    }
+    body += `<h2 style="margin-top:12px">Response ${e.status}</h2><pre>${esc(JSON.stringify(e.response, null, 2))}</pre>`;
+    return `<details class="ex"><summary><span class="m">${e.method}</span><span>${esc(e.path.replace(/snap_[0-9a-f]+/, "{id}"))}</span><span style="color:var(--muted)">${what}</span><span class="ms">${e.ms} ms</span></summary><div class="jsonbox">${body}</div></details>`;
+  }).join("");
+}
+
+// ---------- sparkline ----------
+const spark = $("spark"), sctx = spark.getContext("2d");
+function drawSpark() {
+  const { w, h, dpr } = fitCanvas(spark, sctx);
+  sctx.clearRect(0, 0, w, h);
+  const n = moves.length; if (!n) return;
+  const pad = 4 * dpr, X = i => pad + (w - 2 * pad) * (n === 1 ? 0 : i / (n - 1));
+  const maxL = Math.max(1, moves[n - 1].lines_total), H = game.height || 20;
+  const heights = moves.map(m => { const c = m.candidates.find(c => c.key === m.pick); return c.features.max_height; });
+  const holes = moves.map(m => m.candidates.find(c => c.key === m.pick).features.holes);
+  sctx.strokeStyle = css("--grid"); sctx.lineWidth = dpr;
+  [0.25, 0.5, 0.75].forEach(f => { sctx.beginPath(); sctx.moveTo(pad, h * f); sctx.lineTo(w - pad, h * f); sctx.stroke(); });
+  const line = (vals, max, color, fill) => {
+    sctx.beginPath();
+    vals.forEach((v, i) => { const y = h - pad - (h - 2 * pad) * Math.min(1, v / max); i ? sctx.lineTo(X(i), y) : sctx.moveTo(X(i), y); });
+    if (fill) { sctx.lineTo(X(n - 1), h - pad); sctx.lineTo(X(0), h - pad); sctx.closePath(); sctx.globalAlpha = 0.15; sctx.fillStyle = color; sctx.fill(); sctx.globalAlpha = 1; }
+    else { sctx.strokeStyle = color; sctx.lineWidth = 1.5 * dpr; sctx.stroke(); }
+  };
+  const linesSeries = moves.map(m => m.lines_total);
+  line(linesSeries, maxL, css("--accent"), true);
+  line(linesSeries, maxL, css("--accent"), false);
+  line(heights, H, css("--heur"), false);
+  line(holes, Math.max(10, ...holes), css("--bad"), false);
+  sctx.strokeStyle = css("--ink"); sctx.lineWidth = dpr;
+  sctx.beginPath(); sctx.moveTo(X(idx), 0); sctx.lineTo(X(idx), h); sctx.stroke();
+}
+spark.addEventListener("click", e => {
+  const r = spark.getBoundingClientRect();
+  show(Math.round((e.clientX - r.left) / r.width * (moves.length - 1)), false);
+});
+
+// ---------- navigation ----------
+function show(i, animate = true) {
+  if (!moves.length) return;
+  idx = Math.max(0, Math.min(moves.length - 1, i));
+  const m = moves[idx], pick = m.candidates.find(c => c.key === m.pick), f = pick.features;
+  $("scrub").value = idx;
+  $("pos").textContent = `${idx + 1} / ${moves.length}`;
+  $("moveline").innerHTML = `<span class="big">#${m.move} ${m.piece} &rarr; ${m.pick}</span>
+    <span>${m.candidates.length} placements, ${m.ms} ms${m.pick === m.heuristic_pick ? ", same as heuristic" : `, heuristic wanted ${m.heuristic_pick}`}</span>
+    <span>lines ${m.lines_total}${m.lines_cleared ? ` (+${m.lines_cleared})` : ""} &middot; holes ${f.holes} &middot; height ${f.max_height}</span>`;
+  hoverKey = null;
+  renderDecision(m);
+  renderExchanges(m);
+  drawSpark();
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (animate && !reduce) { anim = 0; animStart = performance.now(); requestAnimationFrame(tick); } else { anim = 1; drawBoard(); }
+}
+function stop() { playing = false; clearTimeout(timer); $("play").textContent = "Play"; }
+function step() {
+  if (!playing) return;
+  if (idx >= moves.length - 1) { stop(); return; }
+  show(idx + 1);
+  timer = setTimeout(step, +$("speed").value);
+}
+$("play").addEventListener("click", () => { if (playing) stop(); else { playing = true; $("play").textContent = "Pause"; if (idx >= moves.length - 1) show(0); timer = setTimeout(step, +$("speed").value); } });
+$("next").addEventListener("click", () => { stop(); show(idx + 1); });
+$("prev").addEventListener("click", () => { stop(); show(idx - 1, false); });
+$("first").addEventListener("click", () => { stop(); show(0, false); });
+$("last").addEventListener("click", () => { stop(); show(moves.length - 1, false); });
+$("scrub").addEventListener("input", e => { stop(); show(+e.target.value, false); });
+document.addEventListener("keydown", e => {
+  if (e.target.closest("input, select, textarea, summary")) return;
+  if (e.key === " ") { e.preventDefault(); $("play").click(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); $("next").click(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); $("prev").click(); }
+  else if (e.key === "Home") $("first").click();
+  else if (e.key === "End") $("last").click();
+});
+$("rounds").addEventListener("mouseover", e => { const c = e.target.closest(".cand"); const k = c ? c.dataset.key : null; if (k !== hoverKey) { hoverKey = k; anim = 1; drawBoard(); } });
+$("rounds").addEventListener("mouseleave", () => { hoverKey = null; drawBoard(); });
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", "false"));
+  load(parseJsonl(await f.text()), f.name);
+});
+window.addEventListener("resize", () => { drawBoard(); drawSpark(); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { drawBoard(); drawSpark(); });
+new MutationObserver(() => { drawBoard(); drawSpark(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+$("tabs").innerHTML = TRACES.map((t, i) => `<button class="tab" role="tab" aria-selected="false" data-i="${i}">${t.label}</button>`).join("");
+$("tabs").addEventListener("click", e => { const b = e.target.closest(".tab"); if (b) openTrace(+b.dataset.i); });
+if (TRACES.length) openTrace(0);
+else $("stats").innerHTML = `<span class="status">Open a trace written by play_tetris.py --trace with the file picker below.</span>`;
+</script>
