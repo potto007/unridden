@@ -229,8 +229,8 @@ less wherever both survived. It took no Tetrises; the single-move games took
 
 ## Model size: 26B-A4B, 12B, E4B
 
-The snapshots worker is built for the 26B-A4B's shape, so this comparison runs
-all three Gemma 4 instruction-tuned models, each UD-Q4_K_XL from
+This comparison predates the `full-v1` profile (ADR 0009) and runs all three
+Gemma 4 instruction-tuned models, each UD-Q4_K_XL from
 `unsloth/gemma-4-*-GGUF`, on the same v1 worker (`--api v1`). There is one
 request per question, no snapshots, and one model on the GPU at a time. Same
 flags as above. Pieces and score for seeds 0 / 1, then mean decision time:
@@ -257,6 +257,9 @@ flags as above. Pieces and score for seeds 0 / 1, then mean decision time:
   snapshots path with `--static-state` (65 vs 32-40 ms for the 26B-A4B). The
   26B-A4B's v1 games also differ from its snapshot games move by move: the
   two runtimes are numerically different, deterministic within each.
+
+[tetris-26b-vs-e4b.md](tetris-26b-vs-e4b.md) repeats the 26B-A4B and E4B
+comparison on both routes, five seeds and five modes each.
 
 ## Reproduce
 

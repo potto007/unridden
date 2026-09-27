@@ -19,7 +19,8 @@ published measurements were taken on.
   recorded game. NES scoring, a next-piece preview, a `strategy` agent that
   plays for high scores (`--rules` enforces the strategy in code), and a
   `--realtime` mode where the piece falls at NES gravity while the agent
-  decides. Results in `docs/results/tetris-demo.md`.
+  decides. Results in `docs/results/tetris-demo.md`; a 26B-A4B vs E4B
+  comparison over both routes in `docs/results/tetris-26b-vs-e4b.md`.
 
 - Experimental Rider mode, `POST /v2/rider` (with `--snapshots`): greedy text
   generation that continues from a saved snapshot on the split runtime without
