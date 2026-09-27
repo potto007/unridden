@@ -41,6 +41,9 @@ class FakeNativeIO:
     async def save(
         self, snapshot_id: str, directory: Path
     ) -> dict[str, WorkerFileEntry]:
+        # Like the native worker, which refuses a relative directory.
+        if not directory.is_absolute():
+            raise ValueError("save needs an existing empty absolute directory")
         name = "../escape" if self.bad_name else "lower_kv.bin"
         payload = f"{snapshot_id}-kv".encode()
         (directory / "lower_kv.bin").write_bytes(payload)
@@ -50,6 +53,8 @@ class FakeNativeIO:
     async def load(
         self, snapshot_id: str, directory: Path, files: dict[str, str]
     ) -> None:
+        if not directory.is_absolute():
+            raise ValueError("load needs an absolute directory")
         for name, checksum in files.items():
             actual = hashlib.sha256((directory / name).read_bytes()).hexdigest()
             if actual != checksum:
@@ -191,6 +196,34 @@ async def test_disk_budget_persists_instead_of_dropping(tmp_path: Path) -> None:
 
     restored = await store.restore(first)
     assert restored.resident is True
+    assert first in native.loaded
+
+
+@pytest.mark.asyncio
+async def test_a_relative_store_root_hands_the_worker_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The systemd units pass a store dir relative to their working directory;
+    # the worker refuses to save into or load from a relative path.
+    monkeypatch.chdir(tmp_path)
+    native = FakeNativeIO()
+    store = SnapshotStore(
+        root=Path("build/snapshots"),
+        native=native,
+        model_sha256="a" * 64,
+        runtime_sha256="b" * 64,
+        profile="split18-30-v1",
+        n_embd=2816,
+        context_size=2048,
+        host_bytes=100,
+        clock=Clock(),
+    )
+    first = await _register(store, host_bytes=60, persistence="disk")
+    await _register(store, host_bytes=60, persistence="disk")
+    await store.restore(first)
+
+    record = store.get(first)
+    assert record.disk_dir == tmp_path / "build" / "snapshots" / first
     assert first in native.loaded
 
 

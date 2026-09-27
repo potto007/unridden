@@ -126,7 +126,9 @@ class SnapshotStore:
     ) -> None:
         if host_bytes <= 0:
             raise ValueError("host byte budget must be positive")
-        self._root = root
+        # Absolute: the worker saves into and loads from these paths itself and
+        # refuses a relative one (the units pass one relative to their cwd).
+        self._root = root.resolve()
         self._native = native
         self._model_sha256 = model_sha256
         self._runtime_sha256 = runtime_sha256
