@@ -15,13 +15,16 @@ import pytest
 
 from scripts.unridden.play_tetris import (
     HEIGHT,
+    WELL,
     WIDTH,
     Unridden,
     choose_choice,
     choose_score,
     empty_board,
     placements,
+    realtime_landing,
     run_game,
+    strategy_filter,
 )
 
 
@@ -94,6 +97,8 @@ def test_choice_runs_a_knockout_within_the_label_alphabet() -> None:
             assert 2 <= len(question["criteria"]) <= 26
     # The fake picks each group's last option, then the second finalist.
     assert pick.key == cands[-1].key
+    assert client.deleted == []  # cleanup waits until the move is made
+    client.flush()
     assert len(client.deleted) == 2
 
 
@@ -120,6 +125,9 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         delay=0.0,
         verbose=False,
         trace=str(trace),
+        realtime=False,
+        start_level=0,
+        rules=False,
     )
     result = run_game(args, FakeUnridden())
 
@@ -130,3 +138,30 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         paths = [e["path"] for e in move["exchanges"]]
         assert paths[0] == "/v2/snapshots"
         assert move["pick"] in {c["key"] for c in move["candidates"]}
+
+
+def test_realtime_decision_in_time_lands_on_target() -> None:
+    board = empty_board()
+    target = placements(board, "T")[-1]  # far right, needs a rotation and shifts
+    landed, info = realtime_landing(board, target, latency_s=0.3, level=0)
+    assert landed is target
+    assert info["outcome"] == "on time"
+
+
+def test_realtime_decision_too_slow_locks_at_spawn() -> None:
+    board = empty_board()
+    target = placements(board, "T")[-1]
+    landed, info = realtime_landing(board, target, latency_s=1.5, level=18)
+    assert landed is not target
+    assert info["outcome"] == "landed before the decision"
+    assert {c for _, c in landed.cells} == {3, 4, 5}  # spawn columns
+
+
+def test_strategy_rules_keep_the_well_for_tetrises() -> None:
+    board = empty_board()
+    for r in range(HEIGHT - 3, HEIGHT):  # three rows ready, well column empty
+        board[r] = ["#"] * (WIDTH - 1) + ["."]
+    kept = strategy_filter(board, placements(board, "I"))
+    assert kept
+    assert all(WELL not in {c for _, c in p.cells} for p in kept)
+    assert all(p.features.new_holes == 0 for p in kept)
