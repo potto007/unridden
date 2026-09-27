@@ -506,7 +506,8 @@ def create_app(
                 "model backend is unavailable",
                 retryable=True,
             )
-        except (BackendExecutionError, BackendProtocolError):
+        except (BackendExecutionError, BackendProtocolError) as error:
+            LOGGER.error("request failed: %s: %s", type(error).__name__, error)
             return _error(500, "internal_error", "request failed internally")
         except BackendRequestError as error:
             if error.reason == "control_tokens":
@@ -570,7 +571,16 @@ async def _run_snapshot(request: Request, coro: Any) -> Any:
     except TimeoutError:
         return _error(408, "timeout", "request timed out", retryable=True)
     except SnapshotError as error:
-        return _snapshot_error(error)
+        response = _snapshot_error(error)
+        # The body stays generic; the cause belongs in the server log.
+        if response.status_code >= 500:
+            LOGGER.log(
+                logging.ERROR if response.status_code == 500 else logging.WARNING,
+                "snapshot request failed: %s: %s",
+                type(error).__name__,
+                error,
+            )
+        return response
     except ValueError:
         return _error(422, "budget_error", "request exceeds model limits")
     except Exception:

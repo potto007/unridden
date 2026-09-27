@@ -31,6 +31,18 @@ from unridden.api.native.bundle import read_manifest, resolve_manifest_paths
 from unridden.api.schema import BackendProfile, WorkerBatchResult
 
 LOGGER = logging.getLogger("unridden.api.native")
+# Lines the workers write when a request or the worker itself fails. Everything
+# else on their stderr is llama.cpp load chatter.
+WORKER_FAILURE_PREFIXES = ("REQUEST_FAILED ", "PREFLIGHT_FAILED ", "WORKER_FAILED ")
+
+
+def worker_line_level(message: str) -> int:
+    """WARNING for a worker's own failure line, DEBUG for the rest."""
+    if message.startswith(WORKER_FAILURE_PREFIXES):
+        return logging.WARNING
+    return logging.DEBUG
+
+
 # Mirrors MAX_PROTOCOL_BYTES in native/worker.cpp; a longer line kills the worker.
 WORKER_PROTOCOL_BYTES = 4 * 1024 * 1024
 
@@ -278,7 +290,12 @@ class NativeBackend:
                 return
             message = line.decode("utf-8", errors="replace").rstrip()[-4096:]
             self._stderr_tail.append(message)
-            LOGGER.debug("native worker pid=%s: %s", process.pid, message)
+            LOGGER.log(
+                worker_line_level(message),
+                "native worker pid=%s: %s",
+                process.pid,
+                message,
+            )
 
     async def _stop_stderr_task(self) -> None:
         task = self._stderr_task

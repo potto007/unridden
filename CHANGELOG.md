@@ -33,6 +33,11 @@ published measurements were taken on.
 
 ### Fixed
 
+- Failures now reach the server log. `serve` sends the `unridden` loggers to
+  stderr (`--log-level`, default info), which the systemd units append to the
+  llama.cpp log; worker failure lines (`REQUEST_FAILED`, `PREFLIGHT_FAILED`,
+  `WORKER_FAILED`) log as warnings instead of debug, and every 5xx logs its
+  underlying error. Before, a worker-side failure showed only as a bare 500.
 - `persistence: "disk"` no longer fails with a 500 when the store directory
   is relative (the default `build/snapshots`, as the systemd units use): the
   store resolves its root, since the worker only saves to and loads from
