@@ -33,6 +33,10 @@ published measurements were taken on.
 
 ### Fixed
 
+- `persistence: "disk"` no longer fails with a 500 when the store directory
+  is relative (the default `build/snapshots`, as the systemd units use): the
+  store resolves its root, since the worker only saves to and loads from
+  absolute paths.
 - `POST /v2/snapshots` with `checkpoints: [30]` alone no longer fails with a
   500: a 30 snapshot created without an 18 keeps H18, which the response
   schema wrongly rejected (#30).
