@@ -91,7 +91,7 @@ async def _register(
     await store.register(
         snapshot_id=snapshot_id,
         owner="local",
-        completed_blocks=completed_blocks,  # type: ignore[arg-type]
+        completed_blocks=completed_blocks,
         boundary="context",
         parent=parent,
         context_parent=None,

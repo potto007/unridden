@@ -195,9 +195,13 @@ class FakeSnapshotBackend:
         kind: Boundary = "context" if freeze.get("kind") == "context" else "readout"
         sha = _sha(content)
         rows: list[WorkerSnapshotRow] = []
-        id18 = checkpoints.get("18")
-        id30 = checkpoints.get("30")
+        # Split: 18 and/or 30. full-v1: only the block count, one whole range.
+        split = self.hello.split_block
+        final = self.hello.final_block
+        id18 = checkpoints.get(str(split)) if split is not None else None
+        id30 = checkpoints.get(str(final))
         paired = bool(id18 and id30)
+        whole = split is None
         if id18:
             self._snaps[id18] = {"tokens": tokens, "content": content, "kind": kind}
             self._resident.add(id18)
@@ -219,14 +223,14 @@ class FakeSnapshotBackend:
             rows.append(
                 WorkerSnapshotRow(
                     snapshot_id=id30,
-                    completed_blocks=30,
+                    completed_blocks=final,
                     parent=parent,
                     tokens=tokens,
                     bytes=SnapshotBytes(
                         lower_kv=0 if paired else tokens,
-                        upper_kv=tokens,
+                        upper_kv=0 if whole else tokens,
                         # Like the worker: an unpaired 30 keeps H18 itself.
-                        h18=0 if paired else tokens,
+                        h18=0 if (paired or whole) else tokens,
                         h30=tokens,
                     ),
                     kind=kind,
@@ -241,7 +245,9 @@ class FakeSnapshotBackend:
             tokens=tokens,
             snapshots=rows,
             readout=readout,
-            block_tokens=BlockTokens(lower=tokens, upper=tokens if id30 else 0),
+            block_tokens=BlockTokens(
+                lower=tokens, upper=tokens if (id30 and not whole) else 0
+            ),
             timing_ms=WorkerCreateTiming(lower=1.0, upper=1.0, total=3.0),
             generated_tokens=0,
         )
@@ -303,7 +309,7 @@ class FakeSnapshotBackend:
             self._resident.add(child_id)
             child = WorkerSnapshotRow(
                 snapshot_id=child_id,
-                completed_blocks=30,
+                completed_blocks=self.hello.final_block,
                 parent=snapshot_id,
                 tokens=reused + suffix,
                 bytes=SnapshotBytes(
@@ -359,7 +365,7 @@ class FakeSnapshotBackend:
             runtime_sha256=HELLO.runtime_sha256,
             generated_tokens=0,
             callbacks_enabled=False,
-            execution_mode="split18-30",
+            execution_mode=self.hello.execution_mode,
             questions=rows,
         )
 
@@ -380,7 +386,7 @@ class FakeSnapshotBackend:
         vectors: dict[str, VectorArtifact] = {}
         if "last_residual" in export:
             vectors["last_residual"] = _vector(
-                [1.0, 2.0, 3.0], "raw_residual_after_block_30"
+                [1.0, 2.0, 3.0], self.hello.final_representation
             )
         if "last_normalized" in export:
             vectors["last_normalized"] = _vector(
@@ -404,7 +410,7 @@ class FakeSnapshotBackend:
             self._resident.add(save_as)
             child = WorkerSnapshotRow(
                 snapshot_id=save_as,
-                completed_blocks=30,
+                completed_blocks=self.hello.final_block,
                 parent=snapshot_id,
                 tokens=reused + suffix,
                 bytes=SnapshotBytes(
@@ -457,7 +463,7 @@ class FakeSnapshotBackend:
             type="ride_result",
             id="g",
             mode="snapshot",
-            execution_mode="split18-30",
+            execution_mode=self.hello.execution_mode,
             text=" ".join(str(token) for token in token_ids),
             token_ids=token_ids,
             stop_reason="max_tokens",
@@ -495,7 +501,7 @@ class FakeSnapshotBackend:
 
         representation = {
             "h18": "raw_residual_after_block_18",
-            "h30": "raw_residual_after_block_30",
+            "h30": self.hello.final_representation,
             "last_normalized": "post_final_norm_head_input",
         }[which]
         returned = row_end - row_begin
@@ -513,7 +519,7 @@ class FakeSnapshotBackend:
                 dtype="f32",
                 byte_order="little",
                 shape=[returned, 2],
-                representation=representation,  # type: ignore[arg-type]
+                representation=representation,
                 base64=encoded,
             ),
         )

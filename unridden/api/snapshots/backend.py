@@ -41,8 +41,10 @@ from unridden.api.snapshots.errors import (
     SnapshotUnavailableError,
 )
 from unridden.api.snapshots.schema import (
+    SNAPSHOT_PROFILE,
     Checkpoint,
     ExportKind,
+    ProfileName,
     WorkerCreated,
     WorkerDropped,
     WorkerErrorMessage,
@@ -73,6 +75,8 @@ _ERROR_CODES: dict[str, type[SnapshotError]] = {
     "integrity_error": IntegrityError,
     "execution_error": SnapshotExecutionError,
 }
+# The execution mode a bundle manifest records for each profile it serves.
+_PROFILE_MODES = {"split18-30-v1": "split18-30", "full-v1": "full"}
 
 
 class VerifiedInstall(NamedTuple):
@@ -183,6 +187,7 @@ class SnapshotNativeBackend:
         ubatch_size: int = 256,
         threads: int = 8,
         reference: bool = False,
+        snapshot_profile: ProfileName = SNAPSHOT_PROFILE,
         max_response_bytes: int = WORKER_PROTOCOL_BYTES,
         default_timeout: float = 120.0,
         startup_timeout: float = 600.0,
@@ -197,6 +202,7 @@ class SnapshotNativeBackend:
         self.ubatch_size = ubatch_size
         self.threads = threads
         self.reference_context = reference
+        self.snapshot_profile = snapshot_profile
         self.max_response_bytes = max_response_bytes
         self.default_timeout = default_timeout
         self.startup_timeout = startup_timeout
@@ -245,10 +251,16 @@ class SnapshotNativeBackend:
             raise ValueError("manifest enables callbacks")
         if manifest.get("protocol") != "unridden-snapshot-v1":
             raise ValueError("manifest is not the snapshot protocol")
-        if manifest.get("profile") != "split18-30-v1":
-            raise ValueError("manifest is not the split18-30 profile")
-        if manifest.get("execution_mode") != "split18-30":
-            raise ValueError("manifest is not a split18-30 build")
+        # A bundle from before ADR 0009 names only its one profile.
+        profiles = manifest.get("profiles")
+        if profiles is None:
+            profiles = {manifest.get("profile"): manifest.get("execution_mode")}
+        if not isinstance(profiles, dict) or self.snapshot_profile not in profiles:
+            raise ValueError(
+                f"manifest does not serve the {self.snapshot_profile} profile"
+            )
+        if profiles[self.snapshot_profile] != _PROFILE_MODES[self.snapshot_profile]:
+            raise ValueError(f"manifest is not a {self.snapshot_profile} build")
         checksums = manifest.get("runtime_sha256")
         if not runtime_dir.is_dir() or not isinstance(checksums, dict) or not checksums:
             raise ValueError("manifest runtime inventory is incomplete")
@@ -307,6 +319,9 @@ class SnapshotNativeBackend:
                 command.append("--gpu")
             if self.reference_context:
                 command.append("--reference")
+            # Omitted for the default so a pre-0009 worker still starts.
+            if self.snapshot_profile != SNAPSHOT_PROFILE:
+                command.extend(["--profile", self.snapshot_profile])
             environment = os.environ.copy()
             library_path = environment.get("LD_LIBRARY_PATH")
             environment["LD_LIBRARY_PATH"] = (
@@ -335,6 +350,7 @@ class SnapshotNativeBackend:
                 or profile.ubatch_size != self.ubatch_size
                 or profile.threads != self.threads
                 or profile.reference_context != self.reference_context
+                or profile.profile != self.snapshot_profile
             ):
                 raise SnapshotProtocolError(
                     "worker handshake differs from configuration"

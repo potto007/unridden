@@ -12,7 +12,7 @@ import base64
 import binascii
 import math
 import struct
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -29,10 +29,16 @@ from unridden.api.schema import (
 )
 
 CONTEXT_PROMPT_VERSION = "unridden-gemma-context-v1"
-SNAPSHOT_PROFILE = "split18-30-v1"
+SNAPSHOT_PROFILE: Final = "split18-30-v1"
+# One whole-model context, any Gemma 4 (ADR 0009).
+FULL_PROFILE: Final = "full-v1"
 SNAPSHOT_PROTOCOL = "unridden-snapshot-v1"
-# The two block boundaries a snapshot can be frozen at, and nothing else.
-type Checkpoint = Literal[18, 30]
+type ProfileName = Literal["split18-30-v1", "full-v1"]
+# More blocks than any served model has; the running profile narrows it.
+MAX_BLOCKS = 256
+# A block boundary a snapshot is frozen at. The worker profile decides which
+# are offered: 18 and 30 for split18-30-v1, the block count for full-v1.
+Checkpoint = Annotated[int, Field(ge=1, le=MAX_BLOCKS)]
 type Persistence = Literal["memory", "disk"]
 type Relationship = Literal["followup", "replace_question"]
 type Boundary = Literal["context", "readout"]
@@ -45,14 +51,15 @@ type ExportKind = Literal["last_residual", "last_normalized", "top_logits"]
 type Representation = Literal[
     "raw_residual_after_block_18",
     "raw_residual_after_block_30",
+    "raw_residual_after_final_block",
     "post_final_norm_head_input",
 ]
 # One day, bounded so a runaway ttl cannot pin a snapshot on the host forever.
 MAX_TTL_SECONDS = 86_400
 # The worker returns at most this many rows per `vectors` call (protocol).
 MAX_VECTOR_ROWS = 64
-# The hidden width and layer count the first profile requires (protocol
-# handshake). A worker that reports anything else is refused at startup.
+# The layer count and boundary split18-30-v1 requires (protocol handshake).
+# A split worker that reports anything else is refused at startup.
 PROFILE_N_EMBD = 2816
 PROFILE_N_LAYER = 30
 PROFILE_SPLIT_BLOCK = 18
@@ -451,8 +458,8 @@ class WorkerCreated(StrictModel):
             raise ValueError("a paired 30 snapshot must name its 18 parent")
         if thirty is not None and 18 in by_depth and thirty.bytes.h18 != 0:
             raise ValueError("a paired 30 snapshot must reference H18, not store it")
-        if self.readout is not None and 30 not in by_depth:
-            raise ValueError("a readout is only produced with a 30 checkpoint")
+        if self.readout is not None and set(by_depth) == {PROFILE_SPLIT_BLOCK}:
+            raise ValueError("a readout is only produced with a final checkpoint")
         for row in self.snapshots:
             if row.tokens != self.tokens:
                 raise ValueError("snapshot token count differs from the prefix")
@@ -492,8 +499,11 @@ class WorkerSnapshotBranch(StrictModel):
     def _restore_accounting(self) -> Self:
         if self.restore == "resident" and self.restored_bytes != 0:
             raise ValueError("a resident branch restored no bytes")
-        if self.child is not None and self.child.completed_blocks != 30:
-            raise ValueError("a saved decision child must be a 30 snapshot")
+        if (
+            self.child is not None
+            and self.child.completed_blocks == PROFILE_SPLIT_BLOCK
+        ):
+            raise ValueError("a saved decision child must be a final snapshot")
         return self
 
 
@@ -516,7 +526,7 @@ class WorkerResult(StrictModel):
     runtime_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     generated_tokens: Literal[0]
     callbacks_enabled: Literal[False]
-    execution_mode: Literal["split18-30"]
+    execution_mode: Literal["split18-30", "full"]
     questions: list[WorkerSnapshotQuestionResult] = Field(min_length=1, max_length=32)
 
 
@@ -544,8 +554,11 @@ class WorkerState(StrictModel):
     def _restore_accounting(self) -> Self:
         if self.restore == "resident" and self.restored_bytes != 0:
             raise ValueError("a resident branch restored no bytes")
-        if self.child is not None and self.child.completed_blocks != 30:
-            raise ValueError("a saved evaluation child must be a 30 snapshot")
+        if (
+            self.child is not None
+            and self.child.completed_blocks == PROFILE_SPLIT_BLOCK
+        ):
+            raise ValueError("a saved evaluation child must be a final snapshot")
         return self
 
 
@@ -562,7 +575,7 @@ class WorkerRide(StrictModel):
     type: Literal["ride_result"]
     id: str = Field(min_length=1)
     mode: Literal["snapshot", "split_prefill", "reference"]
-    execution_mode: Literal["split18-30", "stock30"]
+    execution_mode: Literal["split18-30", "full", "stock30"]
     text: str
     token_ids: list[int]
     stop_reason: StopReason
@@ -648,12 +661,14 @@ class WorkerVectors(StrictModel):
         shape_rows = self.tensor.shape[0] if len(self.tensor.shape) == 2 else 1
         if shape_rows != returned:
             raise ValueError("vectors tensor rows differ from the slice")
+        # `h30` is the residual after the final block: block 30 in the split
+        # profile. The service checks the tag against the running profile.
         expected = {
-            "h18": "raw_residual_after_block_18",
-            "h30": "raw_residual_after_block_30",
-            "last_normalized": "post_final_norm_head_input",
+            "h18": {"raw_residual_after_block_18"},
+            "h30": {"raw_residual_after_block_30", "raw_residual_after_final_block"},
+            "last_normalized": {"post_final_norm_head_input"},
         }[self.which]
-        if self.tensor.representation != expected:
+        if self.tensor.representation not in expected:
             raise ValueError("vectors representation does not match the tensor")
         return self
 
@@ -686,7 +701,7 @@ class WorkerDropped(StrictModel):
 class WorkerHello(StrictModel):
     type: Literal["hello"]
     protocol: Literal["unridden-snapshot-v1"]
-    profile: Literal["split18-30-v1"]
+    profile: ProfileName
     model_id: Literal["local-gemma-unridden-v1"]
     model_name: str = Field(min_length=1)
     model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -697,9 +712,9 @@ class WorkerHello(StrictModel):
     batch_size: int = Field(ge=1)
     ubatch_size: int = Field(ge=1)
     threads: int = Field(ge=1)
-    n_layer: Literal[30]
+    n_layer: int = Field(ge=1, le=MAX_BLOCKS)
     n_embd: int = Field(ge=1)
-    split_block: Literal[18]
+    split_block: Literal[18] | None
     reference_context: bool
     context_prompt_version: Literal["unridden-gemma-context-v1"]
     generated_tokens: Literal[0]
@@ -717,6 +732,51 @@ class WorkerHello(StrictModel):
             raise ValueError("label token ids must be unique")
         return self
 
+    @model_validator(mode="after")
+    def _profile_shape(self) -> Self:
+        if self.profile == SNAPSHOT_PROFILE:
+            if (
+                self.n_layer != PROFILE_N_LAYER
+                or self.split_block != PROFILE_SPLIT_BLOCK
+            ):
+                raise ValueError("split18-30-v1 needs 30 blocks split at 18")
+        elif self.split_block is not None:
+            raise ValueError("full-v1 has no split block")
+        if self.profile == FULL_PROFILE and self.reference_context:
+            raise ValueError("full-v1 has no reference context")
+        return self
+
+    @property
+    def final_block(self) -> int:
+        return self.n_layer
+
+    @property
+    def checkpoints(self) -> list[int]:
+        """The block boundaries this profile can freeze at, low to high."""
+        if self.split_block is None:
+            return [self.n_layer]
+        return [self.split_block, self.n_layer]
+
+    @property
+    def execution_mode(self) -> Literal["split18-30", "full"]:
+        return "full" if self.profile == FULL_PROFILE else "split18-30"
+
+    @property
+    def final_representation(self) -> Representation:
+        if self.profile == FULL_PROFILE:
+            return "raw_residual_after_final_block"
+        return "raw_residual_after_block_30"
+
+    @property
+    def layer_map(self) -> dict[str, list[int]]:
+        """The layer ranges a snapshot blob covers, recorded in its manifest."""
+        if self.split_block is None:
+            return {"lower": [0, self.n_layer]}
+        return {
+            "lower": [0, self.split_block],
+            "upper": [self.split_block, self.n_layer],
+        }
+
 
 class WorkerErrorMessage(StrictModel):
     # Kept permissive on unknown codes so a new worker code is a typed protocol
@@ -733,6 +793,8 @@ class WorkerErrorMessage(StrictModel):
 
 __all__ = [
     "CONTEXT_PROMPT_VERSION",
+    "FULL_PROFILE",
+    "MAX_BLOCKS",
     "MAX_TTL_SECONDS",
     "MAX_VECTOR_ROWS",
     "PROFILE_N_EMBD",
@@ -750,6 +812,7 @@ __all__ = [
     "ExportKind",
     "Persistence",
     "Promotion",
+    "ProfileName",
     "PromptInput",
     "Readout",
     "Relationship",

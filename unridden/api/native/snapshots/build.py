@@ -4,7 +4,8 @@ The base must come from `scripts/unridden/build_base_runtime.py --patch
 unridden/api/native/patches/gemma4-layer-range.patch`; its manifest records
 the patch by sha256 and this build refuses any other base. The bundle has the
 v1 layout (`build/<binary>`, `runtime/`, `build.json`) so the same install
-checks apply, with `execution_mode` naming the split profile.
+checks apply, with `execution_mode` naming the default split profile and
+`profiles` every profile the binary serves (ADR 0009).
 
 Example:
 
@@ -36,6 +37,9 @@ PATCH_NAME = "gemma4-layer-range.patch"
 BINARY_NAME = "unridden-snapshot-worker"
 EXECUTABLE_RELATIVE = Path("build") / BINARY_NAME
 PROFILE = "split18-30-v1"
+FULL_PROFILE = "full-v1"
+# Every profile the binary serves (`--profile`) and its execution mode.
+PROFILES = {PROFILE: "split18-30", FULL_PROFILE: "full"}
 PROTOCOL = "unridden-snapshot-v1"
 
 
@@ -128,9 +132,15 @@ def build(base: Path, output: Path) -> Row:
             "cuda_fusion": True,
             "cuda_graphs": True,
             "layer_ranges": {"lower": [0, 18], "upper": [18, 30]},
+            "profile_layer_ranges": {
+                PROFILE: {"lower": [0, 18], "upper": [18, 30]},
+                FULL_PROFILE: {"lower": [0, -1]},
+            },
         },
         "protocol": PROTOCOL,
+        # The default profile; `profiles` lists every one the binary serves.
         "profile": PROFILE,
+        "profiles": PROFILES,
         "callbacks_enabled": False,
         "generated_tokens": 0,
         "execution_mode": "split18-30",

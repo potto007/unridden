@@ -18,6 +18,14 @@ published measurements were taken on.
   re-prefilling the snapshot prefix (ADR 0007, named in ADR 0008). The snapshot
   worker gains a `ride` command. This is the one route that generates tokens;
   `/v1` and the decision routes still generate none.
+- Snapshot profile `full-v1` (`--snapshot-profile full-v1`, ADR 0009): one
+  whole-model context on the stock graph, so `/v2` serves any Gemma 4,
+  including E4B with its shared K/V and per-layer inputs. Snapshots exist only
+  at the model's block count (42 for E4B), with no promotion. `checkpoints` and
+  `readout.completed_blocks` are now integers the running profile validates
+  (`capability_unavailable` otherwise); 26B clients sending 18/30 see no
+  change. The final residual is tagged `raw_residual_after_final_block` and
+  read as `which=final`. The worker bundle manifest lists `profiles`.
 
 ### Fixed
 

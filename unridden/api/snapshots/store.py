@@ -40,8 +40,8 @@ MANIFEST_SCHEMA_VERSION = 2
 MANIFEST_NAME = "manifest.json"
 # A snapshot id is opaque and must be safe to use as a single path component.
 _ID_PATTERN = re.compile(r"^snap_[0-9a-f]{32}$")
-# The fixed lower/upper layer map for the first profile (design "runtime
-# design"). Recorded so a restore refuses a blob captured under another split.
+# The lower/upper layer map of split18-30-v1 (design "runtime design"), the
+# default. Recorded so a restore refuses a blob captured under another split.
 LAYER_MAP = {"lower": [0, 18], "upper": [18, 30]}
 
 
@@ -100,9 +100,10 @@ class SnapshotRecord:
     last_used: int = 0
     persisted_host_bytes: int = 0
 
-    def capabilities(self) -> list[str]:
+    def capabilities(self, split_block: int | None = 18) -> list[str]:
+        """What a caller can do with it; only the split block promotes."""
         caps = ["continue", "inspect"]
-        if self.completed_blocks == 18:
+        if split_block is not None and self.completed_blocks == split_block:
             caps.insert(1, "promote")
         return caps
 
@@ -119,6 +120,8 @@ class SnapshotStore:
         n_embd: int,
         context_size: int,
         host_bytes: int,
+        layer_map: dict[str, list[int]] | None = None,
+        split_block: int | None = 18,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if host_bytes <= 0:
@@ -131,6 +134,9 @@ class SnapshotStore:
         self._n_embd = n_embd
         self._context_size = context_size
         self._host_bytes = host_bytes
+        self._layer_map = LAYER_MAP if layer_map is None else layer_map
+        # None for a profile without an early checkpoint (full-v1).
+        self._split_block = split_block
         self._clock = clock
         self._records: dict[str, SnapshotRecord] = {}
         self._resident_bytes = 0
@@ -289,6 +295,9 @@ class SnapshotStore:
         ):
             raise IntegrityError("promoted snapshot does not match its 18-block parent")
 
+    def capabilities(self, record: SnapshotRecord) -> list[str]:
+        return record.capabilities(self._split_block)
+
     # -- access ------------------------------------------------------------
 
     def get(self, snapshot_id: str) -> SnapshotRecord:
@@ -311,7 +320,7 @@ class SnapshotStore:
             persistence=record.persistence,
             resident=record.resident,
             tokens=record.tokens,
-            capabilities=record.capabilities(),  # type: ignore[arg-type]
+            capabilities=self.capabilities(record),  # type: ignore[arg-type]
             created_at=record.created_at,
             expires_at=record.expires_at,
         )
@@ -405,7 +414,7 @@ class SnapshotStore:
         return False
 
     def _has_resident_shared_child(self, parent: SnapshotRecord) -> bool:
-        return parent.completed_blocks == 18 and any(
+        return parent.completed_blocks == self._split_block and any(
             child.parent == parent.id
             and child.completed_blocks == 30
             and child.tokens == parent.tokens
@@ -437,7 +446,7 @@ class SnapshotStore:
             "profile": self._profile,
             "completed_blocks": record.completed_blocks,
             "boundary": record.boundary,
-            "layer_map": LAYER_MAP,
+            "layer_map": self._layer_map,
             "dtype": "f32",
             "n_embd": self._n_embd,
             "tokens": record.tokens,
@@ -526,7 +535,7 @@ class SnapshotStore:
             raise IntegrityError("snapshot was captured under another profile")
         if manifest.get("n_embd") != self._n_embd:
             raise IntegrityError("snapshot hidden width differs from the profile")
-        if manifest.get("layer_map") != LAYER_MAP:
+        if manifest.get("layer_map") != self._layer_map:
             raise IntegrityError("snapshot layer map differs from the profile")
         if manifest.get("completed_blocks") != record.completed_blocks:
             raise IntegrityError("snapshot depth differs from its record")

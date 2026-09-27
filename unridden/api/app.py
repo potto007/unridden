@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -116,6 +116,9 @@ class ApiConfig:
     snapshot_default_ttl: int = 3600
     # Only the qualification harness needs the stock full-depth reference context.
     snapshot_reference: bool = False
+    # split18-30-v1 (26B-A4B, early checkpoint and promotion) or full-v1 (any
+    # Gemma 4, one whole-model checkpoint; ADR 0009).
+    snapshot_profile: Literal["split18-30-v1", "full-v1"] = "split18-30-v1"
 
     def __post_init__(self) -> None:
         positive = {
@@ -257,6 +260,7 @@ def _default_snapshot_backend(config: ApiConfig) -> SnapshotBackend:
         ubatch_size=config.ubatch_size,
         threads=config.threads,
         reference=config.snapshot_reference,
+        snapshot_profile=config.snapshot_profile,
         max_response_bytes=config.max_response_bytes,
         default_timeout=config.request_timeout,
         startup_timeout=config.startup_timeout,
