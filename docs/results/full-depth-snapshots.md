@@ -117,7 +117,8 @@ over `/v1` on the same model. The client reads the readout block from
 - E2B cannot play single-move: every game tops out within 51-76 pieces on
   either path. With lookahead it survives 300 pieces in 3 of 6 games through
   snapshots and in none over `/v1`, so it is usable only with lookahead, and
-  even then not reliably.
+  even then not reliably. E2B is not adopted; E4B is the small model served
+  (`localai-unridden-snapshots-e4b.service`).
 - 26B regression: the level-29 lookahead game on seed 0 through the new
   binary reproduced the pre-change run exactly (157,200 points, 119 lines,
   79,492 input tokens).
