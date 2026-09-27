@@ -134,6 +134,8 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         compact=False,
         nes_delays=False,
         pipeline=False,
+        static_state=False,
+        dense_board=False,
     )
     result = run_game(args, FakeUnridden())
 
@@ -205,6 +207,8 @@ def test_pipelining_gives_the_next_piece_a_head_start(
         compact=True,
         nes_delays=True,
         pipeline=pipeline,
+        static_state=False,
+        dense_board=False,
     )
     run_game(args, FakeUnridden())
     moves = [json.loads(x) for x in trace.read_text().splitlines()][1:-1]
@@ -216,3 +220,36 @@ def test_pipelining_gives_the_next_piece_a_head_start(
     # never exceeds the previous piece's time on the board.
     for i in range(1, len(moves)):
         assert head[i] <= 1000 * (spawn[i] - spawn[i - 1]) + 0.1
+
+
+def test_static_state_keeps_one_snapshot_for_the_game(tmp_path: Path) -> None:
+    client = FakeUnridden()
+    args = argparse.Namespace(
+        agent="choice",
+        url="http://fake",
+        seed=0,
+        max_pieces=8,
+        hints=False,
+        watch=False,
+        delay=0.0,
+        verbose=False,
+        trace=None,
+        realtime=False,
+        start_level=0,
+        rules=False,
+        prune=False,
+        compact=True,
+        nes_delays=False,
+        pipeline=False,
+        static_state=True,
+        dense_board=True,
+    )
+    run_game(args, client)
+    used = {body["snapshot"]["id"] for body in client.decision_bodies}
+    assert len(client.decision_bodies) > 1
+    assert len(used) == 1  # every move branched from the same kept snapshot
+    assert client.kept == {}  # closed at the end of the game
+    assert len(client.deleted) == 1
+    for body in client.decision_bodies:
+        for question in body["questions"].values():
+            assert "Current board:" in question["instructions"]
