@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,19 @@ async def evaluate_requests(
         return responses
     finally:
         await service.close()
+
+
+def configure_logging(level: str) -> None:
+    """Send the `unridden` loggers to stderr, where the units append it to the
+    canonical llama.cpp log. Uvicorn configures only its own loggers."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger = logging.getLogger("unridden")
+    logger.handlers = [handler]
+    logger.setLevel(level.upper())
+    logger.propagate = False
 
 
 def write_responses(path: Path, responses: Sequence[DecisionResponse]) -> None:
@@ -181,6 +195,12 @@ def main() -> None:
     _add_runtime_arguments(serve)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8090)
+    serve.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        default="info",
+        help="unridden log level; debug adds all native worker stderr",
+    )
     worker = commands.add_parser("worker", help="manage the native worker install")
     worker_commands = worker.add_subparsers(dest="worker_command", required=True)
     fetch = worker_commands.add_parser(
@@ -192,6 +212,7 @@ def main() -> None:
         raise SystemExit(worker_fetch.run(fetch, args))
     config = _config(args)
     if args.command == "serve":
+        configure_logging(args.log_level)
         uvicorn.run(create_app(config), host=args.host, port=args.port)
         return
     if args.output.exists():

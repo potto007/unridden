@@ -27,6 +27,7 @@ from unridden.api.native.build import (
     is_tested_revision,
 )
 from unridden.api.native.bundle import read_manifest, resolve_manifest_paths
+from unridden.api.native_backend import worker_line_level
 from unridden.api.snapshots.errors import (
     CapabilityUnavailable,
     FollowupUnsupported,
@@ -388,7 +389,12 @@ class SnapshotNativeBackend:
                 return
             message = line.decode("utf-8", errors="replace").rstrip()[-4096:]
             self._stderr_tail.append(message)
-            LOGGER.debug("snapshot worker pid=%s: %s", process.pid, message)
+            LOGGER.log(
+                worker_line_level(message),
+                "snapshot worker pid=%s: %s",
+                process.pid,
+                message,
+            )
 
     async def _stop_stderr_task(self) -> None:
         task = self._stderr_task
