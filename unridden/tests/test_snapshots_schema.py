@@ -76,7 +76,9 @@ def test_create_request_sorts_and_rejects_bad_checkpoints() -> None:
                 "ttl_seconds": 60,
             }
         )
-    for bad in ([], [19], [18, 30, 30]):
+    # Which blocks are offered is the running profile's call (ADR 0009); the
+    # schema bounds only the shape.
+    for bad in ([], [0], [257], [18, 30, 30]):
         with pytest.raises(ValidationError):
             SnapshotCreateRequest.model_validate(
                 {

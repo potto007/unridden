@@ -134,6 +134,12 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="load the stock reference context (qualification harness only)",
     )
+    parser.add_argument(
+        "--snapshot-profile",
+        choices=["split18-30-v1", "full-v1"],
+        default=defaults.snapshot_profile,
+        help="full-v1 serves any Gemma 4 with one whole-model checkpoint",
+    )
 
 
 def _config(args: argparse.Namespace) -> ApiConfig:
@@ -159,6 +165,7 @@ def _config(args: argparse.Namespace) -> ApiConfig:
         snapshot_host_bytes=args.snapshot_host_bytes,
         snapshot_default_ttl=args.snapshot_ttl,
         snapshot_reference=args.snapshot_reference,
+        snapshot_profile=args.snapshot_profile,
     )
 
 

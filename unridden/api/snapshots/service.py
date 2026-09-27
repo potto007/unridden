@@ -38,7 +38,6 @@ from unridden.api.snapshots.errors import (
 )
 from unridden.api.snapshots.mapping import map_answer
 from unridden.api.snapshots.schema import (
-    SNAPSHOT_PROFILE,
     BlockTokens,
     Persistence,
     Promotion,
@@ -69,12 +68,25 @@ LOGGER = logging.getLogger("unridden.api.snapshots.service")
 # so a worker that cannot start is not respawned on every request.
 RECOVERY_BACKOFF_SECONDS = 10.0
 
-# The export kind and the representation tag the worker must stamp on it, so a
-# raw residual is never mistaken for a post-norm head input.
-_REPRESENTATION = {
-    "last_residual": "raw_residual_after_block_30",
-    "last_normalized": "post_final_norm_head_input",
+# Public vector names per profile and the worker slot each reads. full-v1 has
+# no block-18 boundary, and its final residual is not after block 30.
+_VECTOR_NAMES = {
+    "split18-30-v1": {"h18": "h18", "h30": "h30", "last_normalized": "last_normalized"},
+    "full-v1": {"final": "h30", "last_normalized": "last_normalized"},
 }
+
+
+def _representation(profile: WorkerHello, kind: str) -> str:
+    """The tag the worker must stamp on an export kind, so a raw residual is
+    never mistaken for a post-norm head input."""
+    if kind == "last_residual":
+        return profile.final_representation
+    return "post_final_norm_head_input"
+
+
+def _require_readout(profile: WorkerHello, blocks: int) -> None:
+    if blocks != profile.final_block:
+        raise CapabilityUnavailable(f"no registered early head for a {blocks} readout")
 
 
 class SnapshotBusyError(RuntimeError):
@@ -147,6 +159,8 @@ class SnapshotService:
             n_embd=profile.n_embd,
             context_size=profile.context_size,
             host_bytes=self._host_bytes,
+            layer_map=profile.layer_map,
+            split_block=profile.split_block,
             clock=self._clock,
         )
 
@@ -270,6 +284,11 @@ class SnapshotService:
         self, request: SnapshotCreateRequest, *, owner: str
     ) -> SnapshotCreateResponse:
         async with self._serialized() as (profile, store):
+            offered = profile.checkpoints
+            if any(block not in offered for block in request.checkpoints):
+                raise CapabilityUnavailable(
+                    f"profile {profile.profile} offers checkpoints {offered}"
+                )
             compiled = compile_create(request.input, profile.labels)
             checkpoints = {
                 str(block): new_snapshot_id() for block in request.checkpoints
@@ -280,8 +299,8 @@ class SnapshotService:
                 if compiled.boundary == "context"
                 else {"kind": "readout"}
             )
-            wants_30 = 30 in request.checkpoints
-            labels = compiled.labels if (wants_30 and compiled.labels) else None
+            wants_final = profile.final_block in request.checkpoints
+            labels = compiled.labels if (wants_final and compiled.labels) else None
             try:
                 result = await self._backend.create(
                     messages=compiled.messages,
@@ -323,7 +342,7 @@ class SnapshotService:
                             boundary=record.boundary,
                             parent=record.parent,
                             context_parent=record.context_parent,
-                            capabilities=record.capabilities(),  # type: ignore[arg-type]
+                            capabilities=store.capabilities(record),  # type: ignore[arg-type]
                         )
                     )
                 return SnapshotCreateResponse(snapshots=rows)
@@ -333,10 +352,14 @@ class SnapshotService:
 
     # -- planning ----------------------------------------------------------
 
-    async def _ensure_30(
-        self, store: SnapshotStore, record: SnapshotRecord, persistence: Persistence
+    async def _ensure_final(
+        self,
+        profile: WorkerHello,
+        store: SnapshotStore,
+        record: SnapshotRecord,
+        persistence: Persistence,
     ) -> tuple[str, Promotion, float]:
-        if record.completed_blocks == 30:
+        if record.completed_blocks == profile.final_block:
             return record.id, "none", 0.0
         existing = store.memoized_promotion(record.id)
         if existing is not None:
@@ -355,7 +378,7 @@ class SnapshotService:
                 await store.register(
                     snapshot_id=promoted.snapshot.snapshot_id,
                     owner=record.owner,
-                    completed_blocks=30,
+                    completed_blocks=profile.final_block,
                     boundary=record.boundary,
                     parent=record.id,
                     context_parent=(
@@ -376,7 +399,9 @@ class SnapshotService:
         store.memoize_promotion(record.id, promoted.snapshot.snapshot_id)
         return promoted.snapshot.snapshot_id, "performed", promoted.timing_ms.total
 
-    async def _plan(self, store: SnapshotStore, ref: SnapshotRef) -> BranchPlan:
+    async def _plan(
+        self, profile: WorkerHello, store: SnapshotStore, ref: SnapshotRef
+    ) -> BranchPlan:
         record = store.get(ref.id)
         if ref.relationship == "replace_question":
             if record.boundary != "readout" or record.context_parent is None:
@@ -384,8 +409,8 @@ class SnapshotService:
                     "snapshot has no context parent to replace its question"
                 )
             context = store.get(record.context_parent)
-            effective, promotion, promotion_ms = await self._ensure_30(
-                store, context, context.persistence
+            effective, promotion, promotion_ms = await self._ensure_final(
+                profile, store, context, context.persistence
             )
             return BranchPlan(
                 requested_parent=ref.id,
@@ -397,8 +422,8 @@ class SnapshotService:
                 answer_prefix=context.answer_prefix,
                 child_context_parent=effective,
             )
-        effective, promotion, promotion_ms = await self._ensure_30(
-            store, record, record.persistence
+        effective, promotion, promotion_ms = await self._ensure_final(
+            profile, store, record, record.persistence
         )
         if record.boundary == "context":
             return BranchPlan(
@@ -432,6 +457,7 @@ class SnapshotService:
 
     async def _register_child(
         self,
+        profile: WorkerHello,
         store: SnapshotStore,
         row: WorkerSnapshotRow,
         plan: BranchPlan,
@@ -443,7 +469,7 @@ class SnapshotService:
         await store.register(
             snapshot_id=row.snapshot_id,
             owner=owner,
-            completed_blocks=30,
+            completed_blocks=profile.final_block,
             boundary="readout",
             parent=plan.effective_parent,
             context_parent=plan.child_context_parent,
@@ -461,10 +487,9 @@ class SnapshotService:
     async def decide(
         self, request: V2DecisionRequest, *, owner: str
     ) -> V2DecisionResponse:
-        if request.readout.completed_blocks != 30:
-            raise CapabilityUnavailable("no registered early head for an 18 readout")
         async with self._serialized() as (profile, store):
-            plan = await self._plan(store, request.snapshot)
+            _require_readout(profile, request.readout.completed_blocks)
+            plan = await self._plan(profile, store, request.snapshot)
             compiled: dict[str, CompiledSnapshotQuestion] = {}
             for question_id, question in request.questions.items():
                 if plan.mode == "context":
@@ -493,7 +518,7 @@ class SnapshotService:
                 ]
                 result = await self._backend.evaluate(
                     snapshot_id=plan.effective_parent,
-                    readout_blocks=30,
+                    readout_blocks=profile.final_block,
                     questions=payloads,
                     timeout=self._request_timeout,
                 )
@@ -528,6 +553,7 @@ class SnapshotService:
                         if row is None or row.snapshot_id != save_id:
                             raise SnapshotProtocolError("worker did not save the child")
                         await self._register_child(
+                            profile,
                             store,
                             row,
                             plan,
@@ -543,7 +569,7 @@ class SnapshotService:
                 requested_parent=plan.requested_parent,
                 effective_parent=plan.effective_parent,
                 promotion=plan.promotion,
-                profile=SNAPSHOT_PROFILE,
+                profile=profile.profile,
                 suffix_tokens=suffix_tokens,
                 block_tokens=BlockTokens(lower=lower, upper=upper),
                 reused_prefix_tokens=parent.tokens,
@@ -567,10 +593,9 @@ class SnapshotService:
     async def state_eval(
         self, request: StateEvaluationRequest, *, owner: str
     ) -> StateEvaluationResponse:
-        if request.readout.completed_blocks != 30:
-            raise CapabilityUnavailable("no registered early head for an 18 readout")
         async with self._serialized() as (profile, store):
-            plan = await self._plan(store, request.snapshot)
+            _require_readout(profile, request.readout.completed_blocks)
+            plan = await self._plan(profile, store, request.snapshot)
             if plan.mode == "context":
                 branch = compile_context_prompt(plan.messages, request.prompt)
             else:
@@ -594,7 +619,7 @@ class SnapshotService:
                 for kind, artifact in state.vectors.items():
                     if kind not in request.readout.export:
                         raise SnapshotProtocolError("worker exported extra vector")
-                    if artifact.representation != _REPRESENTATION[kind]:
+                    if artifact.representation != _representation(profile, kind):
                         raise SnapshotProtocolError("worker vector tag is wrong")
                     vectors[kind] = artifact
                 child_id: str | None = None
@@ -603,6 +628,7 @@ class SnapshotService:
                     if row is None or row.snapshot_id != save_id:
                         raise SnapshotProtocolError("worker did not save the child")
                     await self._register_child(
+                        profile,
                         store,
                         row,
                         plan,
@@ -641,7 +667,7 @@ class SnapshotService:
         async with self._serialized() as (profile, store):
             if not profile.rider_mode:
                 raise CapabilityUnavailable("the snapshot worker has no rider mode")
-            plan = await self._plan(store, request.snapshot)
+            plan = await self._plan(profile, store, request.snapshot)
             if plan.mode == "context":
                 branch = compile_context_prompt(plan.messages, request.prompt)
             else:
@@ -707,21 +733,27 @@ class SnapshotService:
     async def vectors(
         self, snapshot_id: str, *, which: str, row_begin: int, row_end: int
     ) -> WorkerTensor:
-        if which not in {"h18", "h30", "last_normalized"}:
-            raise SnapshotRequestError("unknown vector name", reason="budget")
         if row_end <= row_begin or row_end - row_begin > 64:
             raise SnapshotRequestError("vector row range invalid", reason="budget")
-        async with self._serialized() as (_, store):
+        async with self._serialized() as (profile, store):
+            slot = _VECTOR_NAMES[profile.profile].get(which)
+            if slot is None:
+                raise SnapshotRequestError("unknown vector name", reason="budget")
             with store.lease(snapshot_id):
                 await store.restore(snapshot_id)
                 worker = await self._backend.vectors(
                     snapshot_id=snapshot_id,
-                    which=which,
+                    which=slot,
                     row_begin=row_begin,
                     row_end=row_end,
                     timeout=self._request_timeout,
                 )
-        # The worker stamps the representation tag; it is validated on parse.
+            # Parsing checks the tag against the slot; the final residual's tag
+            # also depends on the profile.
+            if slot == "h30" and (
+                worker.tensor.representation != profile.final_representation
+            ):
+                raise SnapshotProtocolError("worker vector tag is wrong")
         return worker.tensor
 
     def models(self) -> dict[str, object]:
@@ -736,16 +768,21 @@ class SnapshotService:
                     "prompt_version": profile.context_prompt_version,
                     "limits": {
                         "context_tokens": profile.context_size,
-                        "checkpoints": [18, 30],
+                        "checkpoints": profile.checkpoints,
                         "questions": 32,
                         "vector_rows": 64,
                         "host_bytes": self._host_bytes,
                     },
                     "capabilities": {
-                        "operations": ["continue", "promote", "inspect"],
+                        "operations": (
+                            ["continue", "promote", "inspect"]
+                            if profile.split_block is not None
+                            else ["continue", "inspect"]
+                        ),
                         "generation": False,
                         "early_head": "none",
-                        "readout_blocks": [30],
+                        "readout_blocks": [profile.final_block],
+                        "vectors": sorted(_VECTOR_NAMES[profile.profile]),
                     },
                 }
             ]

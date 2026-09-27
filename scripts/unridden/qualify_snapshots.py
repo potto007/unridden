@@ -1,4 +1,4 @@
-"""Qualify the split18-30-v1 snapshot worker against its release gates.
+"""Qualify a snapshot worker profile against its release gates.
 
 Drives the native `unridden-snapshot-worker` directly (no HTTP layer) over the
 frozen `unridden/examples/api-v1-cases.json` corpus and checks the gates of
@@ -16,15 +16,21 @@ release criteria":
                          (prefix + suffix chunking) against the same stock run
 6. branch isolation    - A,B,A and reversed order, after failed requests;
                          parent blobs byte-identical before and after
-7. rejections          - 18 readout, corrupt blob, budget overflow, prefix
+7. rejections          - early readout, corrupt blob, budget overflow, prefix
                          mismatch
+
+`--profile full-v1` (ADR 0009) runs one whole-model context whose only
+checkpoint is the model's block count, so gates 4 and 5 do not apply. In their
+place an informational row compares each branch with the same prompt run
+fresh from an empty cache in one pass.
 
 Tolerances are fixed here, before any run. A violated gate is a failure, never
 a reason to relax it. The worker needs the GPU; run only with the user's
 confirmation and with multi-GiB VRAM headroom.
 
     python scripts/unridden/qualify_snapshots.py \\
-        --bundle build/snapshot-worker --model <gguf> --gpu --out outputs/snapshots
+        --bundle build/snapshot-worker --model <gguf> --gpu --out outputs/snapshots \\
+        [--profile full-v1]
 """
 
 from __future__ import annotations
@@ -53,6 +59,8 @@ RESTORE_PROB_TOLERANCE = 1e-5
 STOCK_PROB_TOLERANCE = 1e-3
 STOCK_L2_TOLERANCE = 1e-3
 PROMPT_VERSION = "unridden-gemma-context-v1"
+SPLIT_PROFILE = "split18-30-v1"
+FULL_PROFILE = "full-v1"
 CONTEXT_INSTRUCTION = (
     "Use the supplied state to answer the request that follows it. "
     "Answer only what is asked."
@@ -90,7 +98,13 @@ class Worker:
     """Blocking JSONL client for one worker process."""
 
     def __init__(
-        self, bundle: Path, model: Path, *, gpu: bool, reference: bool
+        self,
+        bundle: Path,
+        model: Path,
+        *,
+        gpu: bool,
+        reference: bool,
+        profile: str = SPLIT_PROFILE,
     ) -> None:
         manifest_path = bundle / "build.json"
         manifest = read_manifest(manifest_path)
@@ -121,26 +135,33 @@ class Worker:
             command.append("--gpu")
         if reference:
             command.append("--reference")
+        if profile != SPLIT_PROFILE:
+            command.extend(["--profile", profile])
         environment = os.environ.copy()
         environment["LD_LIBRARY_PATH"] = str(runtime_dir)
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=open("/tmp/unridden-snapshot-worker.stderr.log", "ab"),  # noqa: SIM115
+            # The worker is llama.cpp: its canonical log, which promtail tails.
+            stderr=open("/tmp/llama-server.log", "ab"),  # noqa: SIM115
             env=environment,
         )
         self.hello = self._read()
         if self.hello.get("protocol") != "unridden-snapshot-v1":
             raise RuntimeError(f"bad handshake {self.hello}")
+        if self.hello.get("profile") != profile:
+            raise RuntimeError(f"worker serves {self.hello.get('profile')}")
         self.labels: list[str] = list(self.hello["labels"])
+        # The readout block: 30 in the split profile, the block count in full-v1.
+        self.final = int(self.hello["n_layer"])
         self.counter = 0
 
     def _read(self) -> Row:
         assert self.process.stdout is not None
         line = self.process.stdout.readline()
         if not line:
-            raise RuntimeError("worker closed stdout; see its stderr log")
+            raise RuntimeError("worker closed stdout; see /tmp/llama-server.log")
         payload: Row = json.loads(line)
         return payload
 
@@ -266,7 +287,14 @@ class Gates:
 
 @contextmanager
 def worker(args: argparse.Namespace, *, reference: bool = False) -> Iterator[Worker]:
-    client = Worker(args.bundle, args.model, gpu=args.gpu, reference=reference)
+    client = Worker(
+        args.bundle,
+        args.model,
+        gpu=args.gpu,
+        # The full-v1 snapshot path already is the stock graph.
+        reference=reference and args.profile == SPLIT_PROFILE,
+        profile=args.profile,
+    )
     try:
         yield client
     finally:
@@ -289,7 +317,7 @@ def evaluate(client: Worker, snapshot: str, questions: list[Row]) -> list[Row]:
         {
             "type": "evaluate",
             "snapshot_id": snapshot,
-            "readout_blocks": 30,
+            "readout_blocks": client.final,
             "questions": payload,
         }
     )
@@ -308,6 +336,173 @@ def save_blobs(client: Worker, snapshot: str, root: Path) -> dict[str, str]:
     }
 
 
+def promotion_and_stock(
+    client: Worker,
+    gates: Gates,
+    name: str,
+    index: int,
+    messages: list[Row],
+    content_bytes: int,
+    n: int,
+    questions: list[Row],
+    resident: list[Row],
+) -> None:
+    """Gates 4 (promotion identity) and 5 (stock vs split): split profile only."""
+    # 4. promotion identity
+    only18 = f"c{index}_solo18"
+    solo = client.call(
+        {
+            "type": "create",
+            "messages": messages,
+            "answer_prefix": "",
+            "freeze": {"kind": "context", "content_bytes": content_bytes},
+            "checkpoints": {"18": only18},
+            "labels": None,
+            "top_logits": 0,
+        }
+    )
+    gates.check(
+        "execution_audit",
+        f"{name}/create18",
+        solo["block_tokens"] == {"lower": n, "upper": 0},
+    )
+    promoted = client.call(
+        {"type": "promote", "snapshot_id": only18, "new_id": f"c{index}_prom"}
+    )
+    gates.check(
+        "execution_audit",
+        f"{name}/promote",
+        promoted["block_tokens"] == {"lower": 0, "upper": n},
+    )
+    via18 = evaluate(client, f"c{index}_prom", questions)
+    for paired, promoted_row in zip(resident, via18, strict=True):
+        delta = prob_delta(paired["label_logits"], promoted_row["label_logits"])
+        gates.check(
+            "promotion_identity",
+            f"{name}/{paired['id']}",
+            delta <= RESTORE_PROB_TOLERANCE
+            and argmax(paired["label_logits"]) == argmax(promoted_row["label_logits"]),
+            delta=delta,
+        )
+
+    # 5. stock vs split, identical tokens and chunking
+    for item, branch in zip(questions, resident, strict=True):
+        stock = client.call(
+            {
+                "type": "reference",
+                "messages": item["messages"],
+                "answer_prefix": ANSWER_PREFIX,
+                "labels": item["labels"],
+                "top_logits": 0,
+            }
+        )
+        readout_id = f"c{index}_{item['id']}_ro"
+        split = client.call(
+            {
+                "type": "create",
+                "messages": item["messages"],
+                "answer_prefix": ANSWER_PREFIX,
+                "freeze": {"kind": "readout"},
+                "checkpoints": {"30": readout_id},
+                "labels": item["labels"],
+                "top_logits": 0,
+            }
+        )
+        tokens = int(split["tokens"])
+        split_h18 = client.call(
+            {
+                "type": "vectors",
+                "snapshot_id": readout_id,
+                "which": "h18",
+                "row_begin": tokens - 1,
+                "row_end": tokens,
+            }
+        )
+        split_h30 = client.call(
+            {
+                "type": "vectors",
+                "snapshot_id": readout_id,
+                "which": "h30",
+                "row_begin": tokens - 1,
+                "row_end": tokens,
+            }
+        )
+        stock_logits = stock["label_logits"]
+        split_logits = split["readout"]["label_logits"]
+        delta = prob_delta(stock_logits, split_logits)
+        l2_18 = relative_l2(
+            decode_vector(split_h18["tensor"]),
+            decode_vector(stock["vectors"]["h18_last"]),
+        )
+        l2_30 = relative_l2(
+            decode_vector(split_h30["tensor"]),
+            decode_vector(stock["vectors"]["h30_last"]),
+        )
+        gates.check(
+            "stock_vs_split",
+            f"{name}/{item['id']}",
+            tokens == stock["tokens"]
+            and delta <= STOCK_PROB_TOLERANCE
+            and l2_18 <= STOCK_L2_TOLERANCE
+            and l2_30 <= STOCK_L2_TOLERANCE
+            and argmax(stock_logits) == argmax(split_logits),
+            delta=delta,
+            l2_h18=l2_18,
+            l2_h30=l2_30,
+        )
+        branch_delta = prob_delta(stock_logits, branch["label_logits"])
+        gates.rows.append(
+            {
+                "gate": "branch_vs_stock",
+                "case": f"{name}/{item['id']}",
+                "passed": branch_delta <= STOCK_PROB_TOLERANCE
+                and argmax(stock_logits) == argmax(branch["label_logits"]),
+                "informational": True,
+                "delta": branch_delta,
+            }
+        )
+        client.call({"type": "drop", "snapshot_id": readout_id})
+    for snapshot in (only18, f"c{index}_prom"):
+        client.call({"type": "drop", "snapshot_id": snapshot})
+
+
+def branch_vs_fresh(
+    client: Worker,
+    gates: Gates,
+    name: str,
+    index: int,
+    questions: list[Row],
+    resident: list[Row],
+) -> None:
+    """full-v1, informational: each branch against its prompt run fresh."""
+    for item, branch in zip(questions, resident, strict=True):
+        readout_id = f"c{index}_{item['id']}_ro"
+        fresh = client.call(
+            {
+                "type": "create",
+                "messages": item["messages"],
+                "answer_prefix": ANSWER_PREFIX,
+                "freeze": {"kind": "readout"},
+                "checkpoints": {str(client.final): readout_id},
+                "labels": item["labels"],
+                "top_logits": 0,
+            }
+        )
+        fresh_logits = fresh["readout"]["label_logits"]
+        delta = prob_delta(fresh_logits, branch["label_logits"])
+        gates.rows.append(
+            {
+                "gate": "branch_vs_fresh",
+                "case": f"{name}/{item['id']}",
+                "passed": delta <= STOCK_PROB_TOLERANCE
+                and argmax(fresh_logits) == argmax(branch["label_logits"]),
+                "informational": True,
+                "delta": delta,
+            }
+        )
+        client.call({"type": "drop", "snapshot_id": readout_id})
+
+
 def run(args: argparse.Namespace) -> Row:
     corpus = json.loads(Path(args.cases).read_text())
     cases = corpus["cases"][: args.limit] if args.limit else corpus["cases"]
@@ -319,8 +514,12 @@ def run(args: argparse.Namespace) -> Row:
     persisted: list[Row] = []
     width = 0
     started = time.monotonic()
+    full = args.profile == FULL_PROFILE
     with worker(args, reference=True) as client:
         width = int(client.hello["n_embd"])
+        final = client.final
+        # The block an early (always refused) readout asks for.
+        early = final - 1 if full else 18
         for index, case in enumerate(cases):
             name = str(case["id"])
             request = DecisionRequest.model_validate(
@@ -341,6 +540,7 @@ def run(args: argparse.Namespace) -> Row:
                         "messages": decision_messages(request.state, block),
                     }
                 )
+            # s30 is the final-block snapshot in either profile.
             s18, s30 = f"c{index}_18", f"c{index}_30"
             created = client.call(
                 {
@@ -348,7 +548,9 @@ def run(args: argparse.Namespace) -> Row:
                     "messages": messages,
                     "answer_prefix": "",
                     "freeze": {"kind": "context", "content_bytes": content_bytes},
-                    "checkpoints": {"18": s18, "30": s30},
+                    "checkpoints": (
+                        {str(final): s30} if full else {"18": s18, "30": s30}
+                    ),
                     "labels": None,
                     "top_logits": 5,
                 }
@@ -357,17 +559,7 @@ def run(args: argparse.Namespace) -> Row:
 
             # 1. capture integrity
             rows = {row["snapshot_id"]: row for row in created["snapshots"]}
-            info18 = client.call({"type": "inspect", "snapshot_id": s18})
             info30 = client.call({"type": "inspect", "snapshot_id": s30})
-            h18 = client.call(
-                {
-                    "type": "vectors",
-                    "snapshot_id": s18,
-                    "which": "h18",
-                    "row_begin": max(0, n - 4),
-                    "row_end": n,
-                }
-            )
             h30 = client.call(
                 {
                     "type": "vectors",
@@ -377,28 +569,57 @@ def run(args: argparse.Namespace) -> Row:
                     "row_end": n,
                 }
             )
-            gates.check(
-                "capture_integrity",
-                name,
-                rows[s18]["bytes"]["h18"] == n * width * 4
-                and rows[s30]["bytes"]["h30"] == n * width * 4
-                and rows[s18]["bytes"]["upper_kv"] == 0
-                and rows[s30]["bytes"]["upper_kv"] > 0
-                and rows[s30]["parent"] == s18
-                and len(info18["token_ids"]) == n == len(info30["token_ids"])
-                and info18["token_ids"] == info30["token_ids"]
-                and h18["tensor"]["shape"] == [min(4, n), width]
-                and len(decode_vector(h30["tensor"])) == width,
-                tokens=n,
-                bytes18=rows[s18]["bytes"],
-                bytes30=rows[s30]["bytes"],
-            )
+            if full:
+                # One range: whole-model K/V and the final residual, nothing else.
+                gates.check(
+                    "capture_integrity",
+                    name,
+                    rows[s30]["bytes"]["h30"] == n * width * 4
+                    and rows[s30]["bytes"]["h18"] == 0
+                    and rows[s30]["bytes"]["upper_kv"] == 0
+                    and rows[s30]["bytes"]["lower_kv"] > 0
+                    and rows[s30]["completed_blocks"] == final
+                    and rows[s30]["parent"] is None
+                    and len(info30["token_ids"]) == n
+                    and h30["tensor"]["representation"]
+                    == "raw_residual_after_final_block"
+                    and len(decode_vector(h30["tensor"])) == width,
+                    tokens=n,
+                    bytes=rows[s30]["bytes"],
+                )
+            else:
+                info18 = client.call({"type": "inspect", "snapshot_id": s18})
+                h18 = client.call(
+                    {
+                        "type": "vectors",
+                        "snapshot_id": s18,
+                        "which": "h18",
+                        "row_begin": max(0, n - 4),
+                        "row_end": n,
+                    }
+                )
+                gates.check(
+                    "capture_integrity",
+                    name,
+                    rows[s18]["bytes"]["h18"] == n * width * 4
+                    and rows[s30]["bytes"]["h30"] == n * width * 4
+                    and rows[s18]["bytes"]["upper_kv"] == 0
+                    and rows[s30]["bytes"]["upper_kv"] > 0
+                    and rows[s30]["parent"] == s18
+                    and len(info18["token_ids"]) == n == len(info30["token_ids"])
+                    and info18["token_ids"] == info30["token_ids"]
+                    and h18["tensor"]["shape"] == [min(4, n), width]
+                    and len(decode_vector(h30["tensor"])) == width,
+                    tokens=n,
+                    bytes18=rows[s18]["bytes"],
+                    bytes30=rows[s30]["bytes"],
+                )
 
-            # 2. execution audit (creation)
+            # 2. execution audit (creation); full-v1 counts every block as lower
             gates.check(
                 "execution_audit",
                 f"{name}/create",
-                created["block_tokens"] == {"lower": n, "upper": n}
+                created["block_tokens"] == {"lower": n, "upper": 0 if full else n}
                 and created["generated_tokens"] == 0,
                 block_tokens=created["block_tokens"],
             )
@@ -416,7 +637,7 @@ def run(args: argparse.Namespace) -> Row:
                         "messages": messages,
                         "answer_prefix": "",
                         "freeze": {"kind": "context", "content_bytes": content_bytes},
-                        "checkpoints": {"18": evictor},
+                        "checkpoints": {str(final) if full else "18": evictor},
                         "labels": None,
                         "top_logits": 0,
                     }
@@ -430,8 +651,9 @@ def run(args: argparse.Namespace) -> Row:
                     f"{name}/{first['id']}",
                     audit["block_tokens"]["lower"]
                     == audit["suffix_tokens"]
-                    == audit["block_tokens"]["upper"]
                     == first["processed_tokens"]
+                    and audit["block_tokens"]["upper"]
+                    == (0 if full else audit["suffix_tokens"])
                     and first["reused_tokens"] == n,
                     snapshot=audit,
                 )
@@ -446,121 +668,20 @@ def run(args: argparse.Namespace) -> Row:
                     exact=first["label_logits"] == again["label_logits"],
                 )
 
-            # 4. promotion identity
-            only18 = f"c{index}_solo18"
-            solo = client.call(
-                {
-                    "type": "create",
-                    "messages": messages,
-                    "answer_prefix": "",
-                    "freeze": {"kind": "context", "content_bytes": content_bytes},
-                    "checkpoints": {"18": only18},
-                    "labels": None,
-                    "top_logits": 0,
-                }
-            )
-            gates.check(
-                "execution_audit",
-                f"{name}/create18",
-                solo["block_tokens"] == {"lower": n, "upper": 0},
-            )
-            promoted = client.call(
-                {"type": "promote", "snapshot_id": only18, "new_id": f"c{index}_prom"}
-            )
-            gates.check(
-                "execution_audit",
-                f"{name}/promote",
-                promoted["block_tokens"] == {"lower": 0, "upper": n},
-            )
-            via18 = evaluate(client, f"c{index}_prom", questions)
-            for paired, promoted_row in zip(resident, via18, strict=True):
-                delta = prob_delta(paired["label_logits"], promoted_row["label_logits"])
-                gates.check(
-                    "promotion_identity",
-                    f"{name}/{paired['id']}",
-                    delta <= RESTORE_PROB_TOLERANCE
-                    and argmax(paired["label_logits"])
-                    == argmax(promoted_row["label_logits"]),
-                    delta=delta,
+            if full:
+                branch_vs_fresh(client, gates, name, index, questions, resident)
+            else:
+                promotion_and_stock(
+                    client,
+                    gates,
+                    name,
+                    index,
+                    messages,
+                    content_bytes,
+                    n,
+                    questions,
+                    resident,
                 )
-
-            # 5. stock vs split, identical tokens and chunking
-            for item, branch in zip(questions, resident, strict=True):
-                stock = client.call(
-                    {
-                        "type": "reference",
-                        "messages": item["messages"],
-                        "answer_prefix": ANSWER_PREFIX,
-                        "labels": item["labels"],
-                        "top_logits": 0,
-                    }
-                )
-                readout_id = f"c{index}_{item['id']}_ro"
-                split = client.call(
-                    {
-                        "type": "create",
-                        "messages": item["messages"],
-                        "answer_prefix": ANSWER_PREFIX,
-                        "freeze": {"kind": "readout"},
-                        "checkpoints": {"30": readout_id},
-                        "labels": item["labels"],
-                        "top_logits": 0,
-                    }
-                )
-                tokens = int(split["tokens"])
-                split_h18 = client.call(
-                    {
-                        "type": "vectors",
-                        "snapshot_id": readout_id,
-                        "which": "h18",
-                        "row_begin": tokens - 1,
-                        "row_end": tokens,
-                    }
-                )
-                split_h30 = client.call(
-                    {
-                        "type": "vectors",
-                        "snapshot_id": readout_id,
-                        "which": "h30",
-                        "row_begin": tokens - 1,
-                        "row_end": tokens,
-                    }
-                )
-                stock_logits = stock["label_logits"]
-                split_logits = split["readout"]["label_logits"]
-                delta = prob_delta(stock_logits, split_logits)
-                l2_18 = relative_l2(
-                    decode_vector(split_h18["tensor"]),
-                    decode_vector(stock["vectors"]["h18_last"]),
-                )
-                l2_30 = relative_l2(
-                    decode_vector(split_h30["tensor"]),
-                    decode_vector(stock["vectors"]["h30_last"]),
-                )
-                gates.check(
-                    "stock_vs_split",
-                    f"{name}/{item['id']}",
-                    tokens == stock["tokens"]
-                    and delta <= STOCK_PROB_TOLERANCE
-                    and l2_18 <= STOCK_L2_TOLERANCE
-                    and l2_30 <= STOCK_L2_TOLERANCE
-                    and argmax(stock_logits) == argmax(split_logits),
-                    delta=delta,
-                    l2_h18=l2_18,
-                    l2_h30=l2_30,
-                )
-                branch_delta = prob_delta(stock_logits, branch["label_logits"])
-                gates.rows.append(
-                    {
-                        "gate": "branch_vs_stock",
-                        "case": f"{name}/{item['id']}",
-                        "passed": branch_delta <= STOCK_PROB_TOLERANCE
-                        and argmax(stock_logits) == argmax(branch["label_logits"]),
-                        "informational": True,
-                        "delta": branch_delta,
-                    }
-                )
-                client.call({"type": "drop", "snapshot_id": readout_id})
 
             # 6. branch isolation
             before = save_blobs(client, s30, scratch)
@@ -579,13 +700,13 @@ def run(args: argparse.Namespace) -> Row:
                 {
                     "type": "evaluate",
                     "snapshot_id": s30,
-                    "readout_blocks": 18,
+                    "readout_blocks": early,
                     "questions": [],
                 },
                 {
                     "type": "evaluate",
                     "snapshot_id": s30,
-                    "readout_blocks": 30,
+                    "readout_blocks": final,
                     "questions": [
                         {
                             "id": "x",
@@ -606,7 +727,7 @@ def run(args: argparse.Namespace) -> Row:
                 except WorkerError as error:
                     expected = (
                         "capability_unavailable"
-                        if failing["readout_blocks"] == 18
+                        if failing["readout_blocks"] == early
                         else "snapshot_prefix_mismatch"
                     )
                     gates.check(
@@ -638,7 +759,7 @@ def run(args: argparse.Namespace) -> Row:
                     "expected": [row["label_logits"] for row in restored],
                 }
             )
-            for snapshot in (s18, s30, only18, f"c{index}_prom"):
+            for snapshot in (s30,) if full else (s18, s30):
                 client.call({"type": "drop", "snapshot_id": snapshot})
 
         # 7. rejections that need no case
@@ -650,7 +771,7 @@ def run(args: argparse.Namespace) -> Row:
                     "messages": [huge],
                     "answer_prefix": "",
                     "freeze": {"kind": "readout"},
-                    "checkpoints": {"30": "huge"},
+                    "checkpoints": {str(final): "huge"},
                     "labels": None,
                     "top_logits": 0,
                 }
@@ -707,7 +828,8 @@ def run(args: argparse.Namespace) -> Row:
 
     shutil.rmtree(scratch, ignore_errors=True)
     return {
-        "profile": "split18-30-v1",
+        "profile": args.profile,
+        "model": args.model.name,
         "tolerances": {
             "restore_prob": RESTORE_PROB_TOLERANCE,
             "stock_prob": STOCK_PROB_TOLERANCE,
@@ -731,6 +853,9 @@ def main() -> None:
         "--cases", type=Path, default=Path("unridden/examples/api-v1-cases.json")
     )
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument(
+        "--profile", choices=[SPLIT_PROFILE, FULL_PROFILE], default=SPLIT_PROFILE
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path("outputs/snapshots"))
     args = parser.parse_args()

@@ -9,6 +9,12 @@
 // Snapshots are immutable host-side records. Every branch restores (or finds
 // still resident) its parent's exact per-range sequence state, appends its own
 // suffix, reads out, and trims back, so siblings never see each other.
+//
+// Profile full-v1 (ADR 0009) keeps the same protocol with one context over
+// the whole model, the stock graph, so it serves any Gemma 4, E4B included.
+// That context is the protocol's `lower` range, the only checkpoint is the
+// model's block count, and the `h30` slot holds the residual after the final
+// block.
 
 #include "chat.h"
 #include "llama.h"
@@ -50,6 +56,7 @@ namespace {
 constexpr size_t MAX_PROTOCOL_BYTES = 4 * 1024 * 1024;
 constexpr const char * PROTOCOL = "unridden-snapshot-v1";
 constexpr const char * PROFILE = "split18-30-v1";
+constexpr const char * FULL_PROFILE = "full-v1";
 constexpr const char * MODEL_ID = "local-gemma-unridden-v1";
 constexpr const char * CONTEXT_PROMPT_VERSION = "unridden-gemma-context-v1";
 constexpr const char * LABEL_CANDIDATES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -84,6 +91,10 @@ struct settings {
     int threads = 8;
     bool gpu = false;
     bool reference = false;
+    bool full = false;  // profile full-v1: one whole-model context
+
+    const char * profile() const { return full ? FULL_PROFILE : PROFILE; }
+    const char * execution_mode() const { return full ? "full" : "split18-30"; }
 };
 
 double elapsed_ms(const steady_clock::time_point started) {
@@ -112,7 +123,8 @@ settings parse_args(int argc, char ** argv) {
             if (!flags.insert(key).second) throw std::runtime_error("Repeated " + key);
             continue;
         }
-        if (!valued.count(key) || index + 1 >= argc || values.count(key)) {
+        const bool optional = key == "--profile";
+        if ((!valued.count(key) && !optional) || index + 1 >= argc || values.count(key)) {
             throw std::runtime_error("Invalid or repeated argument: " + key);
         }
         values[key] = argv[++index];
@@ -134,6 +146,12 @@ settings parse_args(int argc, char ** argv) {
     if (result.ubatch != result.batch) throw std::runtime_error("ubatch must equal batch");
     result.gpu = flags.count("--gpu") > 0;
     result.reference = flags.count("--reference") > 0;
+    const std::string profile = values.count("--profile") ? values.at("--profile") : PROFILE;
+    if (profile != PROFILE && profile != FULL_PROFILE) throw std::runtime_error("Unknown profile " + profile);
+    result.full = profile == FULL_PROFILE;
+    // The full-v1 snapshot path already is the stock graph; the reference
+    // context exists only to qualify the split against it.
+    if (result.full && result.reference) throw std::runtime_error("--reference needs the split profile");
     return result;
 }
 
@@ -328,6 +346,14 @@ public:
         : config_(config), model_(model), vocab_(llama_model_get_vocab(model)),
           n_embd_(llama_model_n_embd(model)), n_layer_(llama_model_n_layer(model)),
           lower_(nullptr, llama_free), upper_(nullptr, llama_free), reference_(nullptr, llama_free) {
+        if (config.full) {
+            // Default range: the stock graph, so shared K/V and per-layer
+            // inputs never cross a boundary. Same fixed-capture rule.
+            lower_ = make_context(0, -1);
+            llama_set_embeddings_layer_inp(lower_.get(), static_cast<uint32_t>(n_layer_), true);
+            llama_set_embeddings_nextn(lower_.get(), true, false);
+            return;
+        }
         lower_ = make_context(0, SPLIT_BLOCK);
         upper_ = make_context(SPLIT_BLOCK, n_layer_);
         // Captures are fixed for each context's lifetime, so create, promote
@@ -343,8 +369,42 @@ public:
     }
 
     int n_embd() const { return n_embd_; }
+    int n_layer() const { return n_layer_; }
+    bool full() const { return config_.full; }
     const llama_vocab * vocab() const { return vocab_; }
     bool has_reference() const { return reference_ != nullptr; }
+
+    // full-v1: every block over `tokens[begin:end)`, appended to seq 0.
+    // Returns the final-block residual rows; fills the last head input and,
+    // when asked, the last position's vocabulary logits.
+    matrix run_full(const std::vector<llama_token> & tokens, size_t begin, size_t end,
+                    std::vector<float> & last_normalized, std::vector<double> * logits) {
+        if (end <= begin || end > tokens.size()) throw std::runtime_error("Bad token range");
+        auto * context = lower_.get();
+        const size_t width = static_cast<size_t>(n_embd_);
+        matrix rows;
+        rows.reserve((end - begin) * width);
+        size_t offset = begin;
+        for (const size_t count : unridden::prefill_chunks(end - begin, static_cast<size_t>(config_.batch))) {
+            auto batch = llama_batch_get_one(const_cast<llama_token *>(tokens.data()) + offset,
+                                             static_cast<int32_t>(count));
+            if (llama_decode(context, batch) != 0) throw std::runtime_error("Full-depth decode failed");
+            llama_synchronize(context);
+            append_layer_rows(context, static_cast<uint32_t>(n_layer_), count, rows);
+            offset += count;
+            if (offset == end) {
+                const float * head = llama_get_embeddings_nextn_ith(context, static_cast<int32_t>(count - 1));
+                if (!head) throw std::runtime_error("Missing head input");
+                last_normalized.assign(head, head + width);
+                if (logits) {
+                    const float * raw = llama_get_logits_ith(context, -1);
+                    if (!raw) throw std::runtime_error("Missing full-depth logits");
+                    logits->assign(raw, raw + llama_vocab_n_tokens(vocab_));
+                }
+            }
+        }
+        return rows;
+    }
 
     // Lower blocks over `tokens[begin:end)`, appended to lower seq 0. Returns
     // the H18 rows of exactly those tokens.
@@ -457,7 +517,7 @@ public:
 
     void clear() {
         llama_memory_clear(llama_get_memory(lower_.get()), true);
-        llama_memory_clear(llama_get_memory(upper_.get()), true);
+        if (upper_) llama_memory_clear(llama_get_memory(upper_.get()), true);
         resident_.clear();
         resident_upper_ = false;
     }
@@ -466,7 +526,7 @@ public:
     // snapshot's exact tokens. Returns restored bytes; 0 means it was resident.
     size_t make_resident(const snapshot & item) {
         const auto held = static_cast<llama_pos>(item.tokens.size()) - 1;
-        const bool want_upper = item.completed_blocks == 30;
+        const bool want_upper = !config_.full && item.completed_blocks == n_layer_;
         if (resident_ == item.id && (!want_upper || resident_upper_) &&
                 llama_memory_seq_pos_max(llama_get_memory(lower_.get()), 0) == held &&
                 (!want_upper || llama_memory_seq_pos_max(llama_get_memory(upper_.get()), 0) == held)) {
@@ -489,6 +549,7 @@ public:
     void trim_to(const snapshot & item) {
         const auto length = static_cast<llama_pos>(item.tokens.size());
         for (auto * context : {lower_.get(), upper_.get()}) {
+            if (!context) continue;
             auto * memory = llama_get_memory(context);
             if (llama_memory_seq_pos_max(memory, 0) >= length &&
                     !llama_memory_seq_rm(memory, 0, length, -1)) {
@@ -728,6 +789,11 @@ private:
         return value;
     }
 
+    // The tag on the `h30` slot: in the split profile block 30 is the last.
+    const char * final_representation() const {
+        return runtime_.full() ? "raw_residual_after_final_block" : "raw_residual_after_block_30";
+    }
+
     // -- registry --------------------------------------------------------
 
     const snapshot & find(const std::string & id) {
@@ -762,7 +828,84 @@ private:
 
     // -- commands --------------------------------------------------------
 
+    // The frozen tokens and prompt hash of a create request.
+    struct frozen {
+        rendered full;
+        std::vector<llama_token> tokens;
+        std::string text;
+        std::vector<int> label_ids;
+    };
+
+    frozen freeze_tokens(const json & request, const std::string & kind) {
+        frozen result;
+        result.full = render(request.at("messages"), request.at("answer_prefix").get<std::string>());
+        if (kind == "context") {
+            if (!request.at("labels").is_null()) throw invalid("internal", "labels need a readout freeze");
+            result.tokens = context_prefix(request.at("messages"), result.full,
+                                           request.at("freeze").at("content_bytes").get<size_t>(), result.text);
+        } else if (kind == "readout") {
+            result.tokens = result.full.tokens;
+            result.text = result.full.prompt;
+            result.label_ids = label_ids_for(request.at("labels"), result.full);
+        } else {
+            throw invalid("internal", "Unknown freeze kind");
+        }
+        return result;
+    }
+
+    // full-v1: one pass over every block, one snapshot at n_layer.
+    json create_full(const json & request) {
+        const std::string kind = request.at("freeze").at("kind").get<std::string>();
+        const auto & checkpoints = request.at("checkpoints");
+        const std::string final_key = std::to_string(runtime_.n_layer());
+        if (!checkpoints.is_object() || checkpoints.size() != 1 || !checkpoints.contains(final_key)) {
+            throw invalid("internal", "checkpoints must be exactly " + final_key);
+        }
+        const std::string id = checkpoints.at(final_key).get<std::string>();
+        require_fresh(id);
+        const frozen input = freeze_tokens(request, kind);
+        const int k = top_k(request);
+        const auto started = steady_clock::now();
+        json response;
+        try {
+            runtime_.clear();
+            snapshot item;
+            std::vector<double> vocabulary;
+            item.h30 = std::make_shared<const matrix>(
+                runtime_.run_full(input.tokens, 0, input.tokens.size(), item.last_normalized, &vocabulary));
+            const double run_ms = elapsed_ms(started);
+            item.id = id;
+            item.completed_blocks = runtime_.n_layer();
+            item.kind = kind;
+            item.tokens = input.tokens;
+            item.prompt_sha256 = sha256_hex(input.text);
+            item.lower_kv = std::make_shared<const blob>(runtime_.save_state(false));
+            const readout value = make_readout(vocabulary, input.label_ids, k);
+            const json readout_value = (input.label_ids.empty() && k == 0) ? json() : readout_json(value);
+            const json row = snapshot_row(item);
+            snapshots_.emplace(id, std::move(item));
+            runtime_.set_resident(id, false);
+            response = {
+                {"type", "created"},
+                {"prompt_sha256", row.at("prompt_sha256")},
+                {"tokens", input.tokens.size()},
+                {"snapshots", json::array({row})},
+                {"readout", readout_value},
+                {"block_tokens", {{"lower", input.tokens.size()}, {"upper", 0}}},
+                {"timing_ms", {{"lower", run_ms}, {"upper", 0.0}, {"total", elapsed_ms(started)}}},
+                {"generated_tokens", 0},
+            };
+        } catch (const protocol_error &) {
+            throw;
+        } catch (const std::exception & error) {
+            runtime_.clear();
+            throw protocol_error("execution_error", "", error.what());
+        }
+        return response;
+    }
+
     json create(const json & request) {
+        if (runtime_.full()) return create_full(request);
         const auto & freeze = request.at("freeze");
         const std::string kind = freeze.at("kind").get<std::string>();
         const auto & checkpoints = request.at("checkpoints");
@@ -878,7 +1021,7 @@ private:
 
     json promote(const json & request) {
         const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
-        if (parent.completed_blocks != 18 || !parent.h18) {
+        if (runtime_.full() || parent.completed_blocks != SPLIT_BLOCK || !parent.h18) {
             throw protocol_error("capability_unavailable", "", "Only an 18 snapshot can be promoted");
         }
         const std::string new_id = request.at("new_id").get<std::string>();
@@ -936,22 +1079,24 @@ private:
         const size_t restored = runtime_.make_resident(parent);
         const double restore_ms = elapsed_ms(mark);
         mark = steady_clock::now();
-        const matrix h18_q = runtime_.run_lower(full.tokens, n, full.tokens.size());
-        const matrix h30_q = runtime_.run_upper(h18_q, static_cast<llama_pos>(n),
-                                                result.last_normalized, &result.vocabulary);
+        const bool whole = runtime_.full();
+        const matrix h18_q = whole ? matrix() : runtime_.run_lower(full.tokens, n, full.tokens.size());
+        const matrix h30_q = whole
+            ? runtime_.run_full(full.tokens, n, full.tokens.size(), result.last_normalized, &result.vocabulary)
+            : runtime_.run_upper(h18_q, static_cast<llama_pos>(n), result.last_normalized, &result.vocabulary);
         const double inference_ms = elapsed_ms(mark);
         const size_t width = static_cast<size_t>(runtime_.n_embd());
         result.last_residual.assign(h30_q.end() - static_cast<std::ptrdiff_t>(width), h30_q.end());
         if (!save_as.empty()) {
             snapshot child;
             child.id = save_as;
-            child.completed_blocks = 30;
+            child.completed_blocks = runtime_.n_layer();
             child.parent = parent.id;
             child.kind = "readout";
             child.tokens = full.tokens;
             child.prompt_sha256 = sha256_hex(full.prompt);
             child.lower_kv = std::make_shared<const blob>(runtime_.save_state(false));
-            child.upper_kv = std::make_shared<const blob>(runtime_.save_state(true));
+            if (!whole) child.upper_kv = std::make_shared<const blob>(runtime_.save_state(true));
             if (parent.h18) {
                 matrix joined(*parent.h18);
                 joined.insert(joined.end(), h18_q.begin(), h18_q.end());
@@ -970,7 +1115,7 @@ private:
         result.accounting = {
             {"parent", parent.id},
             {"suffix_tokens", suffix},
-            {"block_tokens", {{"lower", suffix}, {"upper", suffix}}},
+            {"block_tokens", {{"lower", suffix}, {"upper", whole ? 0 : suffix}}},
             {"restore", restored == 0 ? "resident" : "host"},
             {"restored_bytes", restored},
             {"restore_ms", restore_ms},
@@ -983,10 +1128,10 @@ private:
 
     json evaluate(const json & request) {
         const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
-        if (request.at("readout_blocks").get<int>() != 30) {
-            throw protocol_error("capability_unavailable", "", "No registered early head for block 18");
+        if (request.at("readout_blocks").get<int>() != runtime_.n_layer()) {
+            throw protocol_error("capability_unavailable", "", "No registered early head for that block");
         }
-        if (parent.completed_blocks != 30) {
+        if (parent.completed_blocks != runtime_.n_layer()) {
             throw protocol_error("capability_unavailable", "", "Evaluate needs a 30 snapshot; promote first");
         }
         const auto & rows = request.at("questions");
@@ -1055,14 +1200,14 @@ private:
             {"runtime_sha256", config_.runtime_sha256},
             {"generated_tokens", 0},
             {"callbacks_enabled", false},
-            {"execution_mode", "split18-30"},
+            {"execution_mode", config_.execution_mode()},
             {"questions", results},
         };
     }
 
     json state_eval(const json & request) {
         const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
-        if (parent.completed_blocks != 30) {
+        if (parent.completed_blocks != runtime_.n_layer()) {
             throw protocol_error("capability_unavailable", "", "state_eval needs a 30 snapshot; promote first");
         }
         const rendered full = render(request.at("messages"), request.at("answer_prefix").get<std::string>());
@@ -1095,7 +1240,7 @@ private:
         json vectors_value = json::object();
         if (exports.count("last_residual")) {
             vectors_value["last_residual"] = vector_json(branch.last_residual.data(), 1, width,
-                                                         "raw_residual_after_block_30");
+                                                         final_representation());
         }
         if (exports.count("last_normalized")) {
             vectors_value["last_normalized"] = vector_json(branch.last_normalized.data(), 1, width,
@@ -1142,7 +1287,7 @@ private:
         } else if (which == "h30" && item.h30) {
             data = item.h30->data();
             rows = item.h30->size() / width;
-            representation = "raw_residual_after_block_30";
+            representation = final_representation();
         } else if (which == "last_normalized" && !item.last_normalized.empty()) {
             data = item.last_normalized.data();
             rows = 1;
@@ -1235,7 +1380,7 @@ private:
         const json native = {
             {"schema_version", NATIVE_SCHEMA_VERSION},
             {"protocol", PROTOCOL},
-            {"profile", PROFILE},
+            {"profile", config_.profile()},
             {"model_sha256", config_.model_sha256},
             {"runtime_sha256", config_.runtime_sha256},
             {"context_size", config_.context},
@@ -1294,14 +1439,16 @@ private:
             if (!condition) throw protocol_error("integrity_error", "", what);
         };
         require(native.value("schema_version", 0) == NATIVE_SCHEMA_VERSION, "native schema differs");
-        require(native.value("profile", "") == PROFILE, "profile differs");
+        require(native.value("profile", "") == config_.profile(), "profile differs");
         require(native.value("model_sha256", "") == config_.model_sha256, "model differs");
         require(native.value("runtime_sha256", "") == config_.runtime_sha256, "runtime differs");
         require(native.value("context_size", 0) == config_.context, "context size differs");
         require(native.value("batch_size", 0) == config_.batch, "batch size differs");
         require(native.value("n_embd", 0) == runtime_.n_embd(), "hidden width differs");
         const int blocks = native.value("completed_blocks", 0);
-        require(blocks == 18 || blocks == 30, "block coverage differs");
+        const bool whole = runtime_.full();
+        const int final_block = runtime_.n_layer();
+        require(blocks == final_block || (!whole && blocks == SPLIT_BLOCK), "block coverage differs");
         const auto & listed = native.at("files");
         for (const auto & [name, entry] : listed.items()) {
             require(data.count(name) > 0, "file not verified: " + name);
@@ -1333,7 +1480,10 @@ private:
         };
         require(data.count("lower_kv.bin") > 0, "lower K/V missing");
         item.lower_kv = std::make_shared<const blob>(data.at("lower_kv.bin"));
-        if (blocks == 30) {
+        if (whole) {
+            require(data.count("upper_kv.bin") == 0 && data.count("h18.f32") == 0,
+                    "a full-depth snapshot holds split state");
+        } else if (blocks == final_block) {
             require(data.count("upper_kv.bin") > 0, "upper K/V missing");
             item.upper_kv = std::make_shared<const blob>(data.at("upper_kv.bin"));
         } else {
@@ -1419,7 +1569,7 @@ private:
         size_t reused = 0;
         if (mode == "snapshot") {
             parent = &find(request.at("snapshot_id").get<std::string>());
-            if (parent->completed_blocks != 30) {
+            if (parent->completed_blocks != runtime_.n_layer()) {
                 throw protocol_error("capability_unavailable", "", "Ride needs a 30 snapshot; promote first");
             }
             (void) branch_suffix(*parent, full);
@@ -1450,6 +1600,8 @@ private:
         const auto advance = [&](size_t begin, size_t end) {
             if (mode == "reference") {
                 runtime_.reference_append(sequence, begin, end, begin == 0, vocabulary);
+            } else if (runtime_.full()) {
+                (void) runtime_.run_full(sequence, begin, end, last_normalized, &vocabulary);
             } else {
                 const matrix h18 = runtime_.run_lower(sequence, begin, end);
                 (void) runtime_.run_upper(h18, static_cast<llama_pos>(begin), last_normalized, &vocabulary);
@@ -1518,7 +1670,7 @@ private:
         return {
             {"type", "ride_result"},
             {"mode", mode},
-            {"execution_mode", mode == "reference" ? "stock30" : "split18-30"},
+            {"execution_mode", mode == "reference" ? "stock30" : config_.execution_mode()},
             {"text", text},
             {"token_ids", output},
             {"stop_reason", stop_reason},
@@ -1528,7 +1680,8 @@ private:
             {"prefilled_tokens", full.tokens.size() - reused},
             {"generated_tokens", output.size()},
             {"block_tokens", mode == "reference" ? json({{"stock", block_tokens}})
-                                                 : json({{"lower", block_tokens}, {"upper", block_tokens}})},
+                                                 : json({{"lower", block_tokens},
+                                                         {"upper", runtime_.full() ? 0 : block_tokens}})},
             {"restore", mode != "snapshot" ? json() : json(restored == 0 ? "resident" : "host")},
             {"restored_bytes", restored},
             {"timing_ms", {
@@ -1583,8 +1736,10 @@ std::string meta(const llama_model * model, const char * key) {
 }
 
 // The split is only sound when no state crosses it other than the residual.
-void require_split_compatible(const llama_model * model) {
+// full-v1 runs the stock graph and needs only a Gemma 4.
+void require_profile_compatible(const llama_model * model, bool full) {
     if (meta(model, "general.architecture") != "gemma4") throw std::runtime_error("Worker supports Gemma4 only");
+    if (full) return;
     if (llama_model_n_layer(model) != EXPECTED_LAYERS) throw std::runtime_error("Profile needs 30 blocks");
     const std::string shared = meta(model, "gemma4.attention.shared_kv_layers");
     if (!shared.empty() && shared != "0") throw std::runtime_error("Shared KV layers cross the split");
@@ -1608,7 +1763,7 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(config.model_path.c_str(), model_params), llama_model_free);
         if (!model) throw std::runtime_error("Model load failed");
-        require_split_compatible(model.get());
+        require_profile_compatible(model.get(), config.full);
         char description[256];
         if (llama_model_desc(model.get(), description, sizeof(description)) < 1) {
             throw std::runtime_error("Model identity is unavailable");
@@ -1621,7 +1776,7 @@ int main(int argc, char ** argv) {
         const json hello = {
             {"type", "hello"},
             {"protocol", PROTOCOL},
-            {"profile", PROFILE},
+            {"profile", config.profile()},
             {"model_id", MODEL_ID},
             {"model_name", std::string(description)},
             {"model_sha256", config.model_sha256},
@@ -1632,9 +1787,9 @@ int main(int argc, char ** argv) {
             {"batch_size", config.batch},
             {"ubatch_size", config.ubatch},
             {"threads", config.threads},
-            {"n_layer", EXPECTED_LAYERS},
+            {"n_layer", llama_model_n_layer(model.get())},
             {"n_embd", llama_model_n_embd(model.get())},
-            {"split_block", SPLIT_BLOCK},
+            {"split_block", config.full ? json() : json(SPLIT_BLOCK)},
             {"reference_context", config.reference},
             {"context_prompt_version", CONTEXT_PROMPT_VERSION},
             {"generated_tokens", 0},

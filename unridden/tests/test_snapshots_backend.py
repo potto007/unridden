@@ -35,6 +35,7 @@ p.add_argument('--context', type=int); p.add_argument('--batch', type=int)
 p.add_argument('--ubatch', type=int); p.add_argument('--threads', type=int)
 p.add_argument('--gpu', action='store_true')
 p.add_argument('--reference', action='store_true')
+p.add_argument('--profile', default='split18-30-v1')
 a=p.parse_args()
 if not os.path.isdir(a.runtime_dir): sys.exit('runtime-dir is not a directory')
 labels=['A','B','C','D']; tok=[11,12,13,14]
@@ -47,6 +48,8 @@ hello={'type':'hello','protocol':'unridden-snapshot-v1','profile':'split18-30-v1
  'context_prompt_version':'unridden-gemma-context-v1','generated_tokens':0,
  'callbacks_enabled':False}
 if 'MODE_BADHELLO' in __file__: hello['n_layer']=28
+if a.profile=='full-v1':
+ hello.update(profile='full-v1', n_layer=42, n_embd=2560, split_block=None)
 print(json.dumps(hello), flush=True)
 print('snapshot fixture diagnostic', file=sys.stderr, flush=True)
 def err(rid, code, reason=None):
@@ -115,7 +118,9 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _install(tmp_path: Path, mode: str = "normal") -> tuple[Path, Path, Path]:
+def _install(
+    tmp_path: Path, mode: str = "normal", profiles: dict[str, str] | None = None
+) -> tuple[Path, Path, Path]:
     worker = tmp_path / "worker"
     worker.write_text(WORKER_SOURCE)
     if mode != "normal":
@@ -152,6 +157,8 @@ def _install(tmp_path: Path, mode: str = "normal") -> tuple[Path, Path, Path]:
                 "callbacks_enabled": False,
                 "execution_mode": "split18-30",
             }
+            # A bundle from before ADR 0009 has no `profiles`.
+            | ({"profiles": profiles} if profiles is not None else {})
         )
     )
     return worker, model, manifest
@@ -177,6 +184,42 @@ async def test_handshake_returns_the_profile(tmp_path: Path) -> None:
     assert profile.protocol == "unridden-snapshot-v1"
     assert profile.profile == "split18-30-v1"
     assert profile.n_layer == 30 and profile.split_block == 18
+
+
+@pytest.mark.asyncio
+async def test_full_profile_starts_from_a_bundle_that_serves_it(
+    tmp_path: Path,
+) -> None:
+    worker, model, manifest = _install(
+        tmp_path, profiles={"split18-30-v1": "split18-30", "full-v1": "full"}
+    )
+    backend = SnapshotNativeBackend(
+        worker_path=worker,
+        model_path=model,
+        manifest_path=manifest,
+        snapshot_profile="full-v1",
+        startup_timeout=2.0,
+    )
+    profile = await backend.start()
+    await backend.close()
+
+    assert profile.profile == "full-v1"
+    assert profile.checkpoints == [42]
+
+
+@pytest.mark.asyncio
+async def test_full_profile_is_refused_by_a_split_only_bundle(tmp_path: Path) -> None:
+    worker, model, manifest = _install(tmp_path)
+    backend = SnapshotNativeBackend(
+        worker_path=worker,
+        model_path=model,
+        manifest_path=manifest,
+        snapshot_profile="full-v1",
+        startup_timeout=2.0,
+    )
+    with pytest.raises(SnapshotUnavailableError, match="does not serve the full-v1"):
+        await backend.start()
+    assert backend.ready is False
 
 
 @pytest.mark.asyncio
