@@ -218,8 +218,11 @@ def placements(board: Board, piece: str) -> list[Placement]:
     return out
 
 
-def render_board(board: Board, highlight: Cells = ()) -> str:
-    """Rows from the highest filled row down, plus a floor; empty sky elided."""
+def render_board(board: Board, highlight: Cells = (), dense: bool = False) -> str:
+    """Rows from the highest filled row down, plus a floor; empty sky elided.
+
+    dense drops the spaces between cells, roughly halving the board's tokens.
+    """
     marks = set(highlight)
     first = next(
         (r for r in range(HEIGHT) if any(ch != "." for ch in board[r])), HEIGHT
@@ -232,9 +235,13 @@ def render_board(board: Board, highlight: Cells = ()) -> str:
             "@" if (r, c) in marks else ("#" if board[r][c] != "." else ".")
             for c in range(WIDTH)
         )
-        lines.append(f"|{' '.join(row)}|")
-    lines.append("+" + "-" * (2 * WIDTH - 1) + "+")
-    lines.append(" " + " ".join(str(c) for c in range(WIDTH)))
+        lines.append(f"|{row}|" if dense else f"|{' '.join(row)}|")
+    if dense:
+        lines.append("+" + "-" * WIDTH + "+")
+        lines.append(" " + "".join(str(c) for c in range(WIDTH)))
+    else:
+        lines.append("+" + "-" * (2 * WIDTH - 1) + "+")
+        lines.append(" " + " ".join(str(c) for c in range(WIDTH)))
     return "\n".join(lines)
 
 
@@ -480,6 +487,7 @@ class Unridden:
         self.seconds = 0.0
         self.exchanges: list[dict[str, Any]] = []  # raw HTTP log for the trace
         self.pending: list[str] = []  # snapshot ids awaiting deletion
+        self.kept: dict[str, str] = {}  # fixed state -> snapshot id, for the game
 
     def _req(self, method: str, path: str, body: Any = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
@@ -517,21 +525,29 @@ class Unridden:
                 raise RuntimeError(message) from None
         raise RuntimeError("unreachable")
 
-    def decide(self, state: str, questions: dict[str, Any]) -> dict[str, Any]:
+    def decide(
+        self, state: str, questions: dict[str, Any], keep: bool = False
+    ) -> dict[str, Any]:
+        """Answer questions over state. keep reuses one snapshot of a fixed state."""
         start = time.monotonic()
-        snap = self._req(
-            "POST",
-            "/v2/snapshots",
-            {
-                "input": {"kind": "context", "state": state},
-                "checkpoints": [30],
-                "persistence": "memory",
-                "ttl_seconds": 300,
-            },
-        )
-        snap_id = snap["snapshots"][0]["id"]
-        # Deleted by flush() once the move is made, so cleanup is off the clock.
-        self.pending.append(snap_id)
+        snap_id = self.kept.get(state) if keep else None
+        if snap_id is None:
+            snap = self._req(
+                "POST",
+                "/v2/snapshots",
+                {
+                    "input": {"kind": "context", "state": state},
+                    "checkpoints": [30],
+                    "persistence": "memory",
+                    "ttl_seconds": 3600 if keep else 300,
+                },
+            )
+            snap_id = snap["snapshots"][0]["id"]
+            if keep:
+                self.kept[state] = snap_id
+            else:
+                # Deleted by flush() once the move is made, off the clock.
+                self.pending.append(snap_id)
         answers: dict[str, Any] = {}
         items = list(questions.items())
         for i in range(0, len(items), 32):
@@ -557,9 +573,15 @@ class Unridden:
                 self._req("DELETE", f"/v2/snapshots/{snap_id}")
         self.pending.clear()
 
+    def close(self) -> None:
+        """Delete the snapshots kept for the game."""
+        self.pending.extend(self.kept.values())
+        self.kept.clear()
+        self.flush()
 
-def state_text(board: Board, piece: str) -> str:
-    board_text = render_board(board)
+
+def state_text(board: Board, piece: str, dense: bool = False) -> str:
+    board_text = render_board(board, dense=dense)
     return f"{RULES}\n\nCurrent board:\n{board_text}\n\nPiece to place: {piece}"
 
 
@@ -599,13 +621,25 @@ def choose_choice(
     piece: str,
     cands: list[Placement],
     compact: bool = False,
+    static_state: bool = False,
+    dense: bool = False,
 ) -> tuple[Placement, str, dict[str, Any]]:
     instructions = (
         f"Pick where to drop the {piece} piece. Prefer placements that clear "
         "lines, create no new holes, and keep the stack low and flat."
     )
     describe_fn = describe_compact if compact else describe
-    return knockout(client, state_text(board, piece), instructions, cands, describe_fn)
+    if static_state:
+        # The rules are the state and stay prefilled for the whole game; the
+        # board travels in the question, so a move is one decisions call.
+        board_text = render_board(board, dense=dense)
+        instructions = (
+            f"Current board:\n{board_text}\n\nPiece to place: {piece}\n\n"
+            + instructions
+        )
+        return knockout(client, RULES, instructions, cands, describe_fn, keep=True)
+    state = state_text(board, piece, dense)
+    return knockout(client, state, instructions, cands, describe_fn)
 
 
 def choose_strategy(
@@ -640,6 +674,7 @@ def knockout(
     instructions: str,
     cands: list[Placement],
     describe_fn: Callable[[Placement], str],
+    keep: bool = False,
 ) -> tuple[Placement, str, dict[str, Any]]:
     """Choice over the placements in balanced groups, then a final of winners.
 
@@ -661,7 +696,7 @@ def knockout(
         groups = [cands[i::count] for i in range(count)] if count > 1 else [cands]
         try:
             answers = client.decide(
-                state, {f"g{i}": question(g) for i, g in enumerate(groups)}
+                state, {f"g{i}": question(g) for i, g in enumerate(groups)}, keep
             )
             break
         except BudgetError:
@@ -681,7 +716,7 @@ def knockout(
     if len(winners) == 1:
         conf = answers["g0"]["confidence"]
         return winners[0], f"conf {conf:.3f}", {"rounds": rounds}
-    final = client.decide(state, {"final": question(winners)})["final"]
+    final = client.decide(state, {"final": question(winners)}, keep)["final"]
     rounds.append(
         {
             "name": "final",
@@ -783,7 +818,15 @@ def choose(
     if args.agent == "heuristic" or client is None:
         return max(cands, key=heuristic_value), "", {}
     if args.agent == "choice":
-        return choose_choice(client, board, piece, cands, args.compact)
+        return choose_choice(
+            client,
+            board,
+            piece,
+            cands,
+            args.compact,
+            args.static_state,
+            args.dense_board,
+        )
     if args.agent == "strategy":
         return choose_strategy(client, board, piece, cands, status, args.rules)
     return choose_score(client, board, piece, cands, args.hints)
@@ -989,6 +1032,8 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             "compact": args.compact,
             "nes_delays": args.nes_delays,
             "pipeline": args.pipeline,
+            "static_state": args.static_state,
+            "dense_board": args.dense_board,
             "heuristic_agreement": round(agree / max(1, placed), 3),
             "wall_s": round(time.monotonic() - t0, 1),
         }
@@ -1000,6 +1045,8 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             )
         if trace:
             trace.write(json.dumps({"type": "result", **result}) + "\n")
+    if client:
+        client.close()
     return result
 
 
@@ -1037,6 +1084,14 @@ def main() -> None:
         "--prune", action="store_true", help="ask only about non-dominated placements"
     )
     ap.add_argument("--compact", action="store_true", help="shorter option text")
+    ap.add_argument(
+        "--static-state",
+        action="store_true",
+        help="choice agent: rules as a game-long snapshot, board in the question",
+    )
+    ap.add_argument(
+        "--dense-board", action="store_true", help="board rows without spaces"
+    )
     ap.add_argument(
         "--nes-delays",
         action="store_true",

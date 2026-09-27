@@ -131,6 +131,33 @@ Plain prompt, seeds 0 and 1, 300-piece cap:
   carry a piece across the board at 3 frames per row, and the zero-latency
   heuristic misses 8 there too.
 
+### One forward pass per move
+
+At these sizes a move costs about one forward pass per call, not per token:
+the 86 ms above is a 47 ms snapshot create (about 190 tokens) plus a 38 ms
+decision (31 ms of inference on about 150 tokens). Two more flags cut it to
+one pass:
+
+- `--static-state` makes the rules text the state, prefilled once as a
+  snapshot kept for the whole game. The board travels in the question, so a
+  move is a single `/v2/decisions` call.
+- `--dense-board` drops the spaces between cells, which keeps that question
+  under the 256-token batch. A longer question splits into two passes.
+
+Turn-based, with `--prune --compact`, 300-piece cap:
+
+| Variant | Decision p50 / p95 | Seed 0 | Seed 1 |
+| --- | --- | --- | --- |
+| neither | 86 / 95-98 ms | 39,040 | 32,540 |
+| `--dense-board` | 79-81 / 92-95 ms | 38,880 | 41,120 |
+| `--static-state` | 44-59 / 74-76 ms | 46,340 | 45,420 |
+| both | 42-44 / 64-72 ms | 49,340 | 37,060 |
+
+Every game survived the cap. With both flags and all four real-time flags,
+level 18 lasted 154 and 117 pieces (41,420 and 50,160 points). The earlier
+runs had no late moves either, so those differences come from different
+choices, not from speed.
+
 ## Reproduce
 
 ```bash
