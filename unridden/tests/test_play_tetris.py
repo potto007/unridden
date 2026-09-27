@@ -26,6 +26,7 @@ from scripts.unridden.play_tetris import (
     prune,
     realtime_landing,
     run_game,
+    shift_frames,
     strategy_filter,
 )
 
@@ -136,6 +137,8 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         pipeline=False,
         static_state=False,
         dense_board=False,
+        movement="das",
+        tap_hz=15.0,
     )
     result = run_game(args, FakeUnridden())
 
@@ -209,6 +212,8 @@ def test_pipelining_gives_the_next_piece_a_head_start(
         pipeline=pipeline,
         static_state=False,
         dense_board=False,
+        movement="das",
+        tap_hz=15.0,
     )
     run_game(args, FakeUnridden())
     moves = [json.loads(x) for x in trace.read_text().splitlines()][1:-1]
@@ -243,6 +248,8 @@ def test_static_state_keeps_one_snapshot_for_the_game(tmp_path: Path) -> None:
         pipeline=False,
         static_state=True,
         dense_board=True,
+        movement="das",
+        tap_hz=15.0,
     )
     run_game(args, client)
     used = {body["snapshot"]["id"] for body in client.decision_bodies}
@@ -253,3 +260,20 @@ def test_static_state_keeps_one_snapshot_for_the_game(tmp_path: Path) -> None:
     for body in client.decision_bodies:
         for question in body["questions"].values():
             assert "Current board:" in question["instructions"]
+
+
+def test_shift_schedules_match_nes_timing() -> None:
+    assert shift_frames(3, "das") == [0, 16, 22]
+    assert shift_frames(3, "charged", charge=16) == [0, 6, 12]
+    assert shift_frames(3, "charged", charge=10) == [6, 12, 18]
+    assert shift_frames(3, "tap", tap_hz=15.0) == [0, 4, 8]
+    assert shift_frames(2, "tap", tap_hz=60.0) == [0, 2]  # press plus release
+
+
+def test_tapping_reaches_a_target_holding_cannot_at_level_29() -> None:
+    board = empty_board()
+    target = next(p for p in placements(board, "I") if p.key == "r0c0")
+    held, held_info = realtime_landing(board, target, 0.0, 29, "das")
+    tapped, _ = realtime_landing(board, target, 0.0, 29, "tap", tap_hz=15.0)
+    assert held is not target and held_info["outcome"] != "on time"
+    assert tapped is target

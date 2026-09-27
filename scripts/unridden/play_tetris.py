@@ -380,16 +380,42 @@ def spawn_fits(board: Board, piece: str) -> bool:
     return fits(board, ROTATIONS[piece][0], 0, spawn_left(piece))
 
 
+def shift_frames(
+    shifts: int, movement: str = "das", tap_hz: float = 15.0, charge: int = 0
+) -> list[int]:
+    """Frames, from the moment input starts, at which each column shift lands.
+
+    das: hold the direction; one shift at once, the next after DAS_DELAY
+    frames, then every DAS_REPEAT. charged: the direction was already held for
+    `charge` frames before the piece spawned (NES keeps counting during the
+    entry delay), so the wait before repeating shrinks and a full charge
+    repeats from frame 0. tap: press repeatedly at tap_hz, one shift per press.
+    """
+    if movement == "tap":
+        gap = max(2, round(FPS / tap_hz))  # a press and a release take 2 frames
+        return [gap * k for k in range(shifts)]
+    if movement == "charged" and charge > 0:
+        first = max(0, DAS_DELAY - charge)
+        return [first + DAS_REPEAT * k for k in range(shifts)]
+    return [0 if k == 0 else DAS_DELAY + DAS_REPEAT * (k - 1) for k in range(shifts)]
+
+
 def realtime_landing(
-    board: Board, target: Placement, latency_s: float, level: int
+    board: Board,
+    target: Placement,
+    latency_s: float,
+    level: int,
+    movement: str = "das",
+    tap_hz: float = 15.0,
+    charge: int = 0,
 ) -> tuple[Placement, dict[str, Any]]:
     """Where the piece really lands if the decision arrives after latency_s.
 
     The piece spawns in rotation 0 and falls at the level's NES gravity while
     the agent thinks. When the decision arrives it rotates once, shifts one
-    column at a time on the NES auto-shift schedule while still falling, and
-    hard-drops when it reaches the target column. A blocked rotation or shift,
-    or landing first, locks the piece wherever it falls.
+    column at a time on the chosen movement schedule (see shift_frames) while
+    still falling, and hard-drops when it reaches the target column. A blocked
+    rotation or shift, or landing first, locks the piece wherever it falls.
     """
     fpr = frames_per_row(level)
     piece = target.piece
@@ -398,10 +424,9 @@ def realtime_landing(
     start = math.ceil(latency_s * FPS)
     step = 1 if target.left > left else -1
     shifts = abs(target.left - left)
-    shift_at = {
-        start + (0 if k == 0 else DAS_DELAY + DAS_REPEAT * (k - 1))
-        for k in range(shifts)
-    }
+    # A charge only exists if the decision was in before the piece spawned.
+    held = charge if start == 0 else 0
+    shift_at = {start + f for f in shift_frames(shifts, movement, tap_hz, held)}
     done_at = max(shift_at, default=start)
     outcome = "on time"
     fallen = 0
@@ -445,6 +470,8 @@ def realtime_landing(
         "rows_fallen_at_decision": fallen,
         "outcome": outcome,
         "lock_frame": frame,
+        "movement": movement,
+        "charge_frames": held,
         "lock_height": HEIGHT - max(r for r, _ in cells),
     }
     if cells == tuple(sorted(target.cells)):
@@ -812,6 +839,8 @@ def choose(
         return cands[0], "forced", {}
     if args.agent == "random":
         return rng.choice(cands), "", {}
+    if args.agent == "pruned":  # non-dominated placements, then a coin flip
+        return rng.choice(prune(cands)), "pruned, random", {}
     if args.agent == "rules":  # the strategy's hard rules, then a coin flip
         kept = strategy_filter(board, cands)
         return rng.choice(kept), f"{len(kept)}/{len(cands)} kept", {}
@@ -927,6 +956,7 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
     # Simulated game clock in seconds (real-time mode). The agent may start on
     # a piece once the board it lands on is known and the agent is free.
     spawn_at = agent_free_at = previewed_at = 0.0
+    last_pause = 0  # frames of entry delay before the current piece
     t0 = time.monotonic()
     agent = args.agent + ("+hints" if args.agent == "score" and args.hints else "")
     with ExitStack() as stack:
@@ -974,7 +1004,13 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                 start = max(visible, agent_free_at)
                 decided = start + latency
                 late_by = max(0.0, decided - spawn_at)
-                landed, timing = realtime_landing(board, pick, late_by, level)
+                # The direction can be held during the entry delay, but only
+                # once the decision is in: charge is capped by both.
+                head = math.floor((spawn_at - decided) * FPS)
+                charge = max(0, min(DAS_DELAY, last_pause, head))
+                landed, timing = realtime_landing(
+                    board, pick, late_by, level, args.movement, args.tap_hz, charge
+                )
                 missed += landed is not pick
                 delay = 0
                 if args.nes_delays:
@@ -987,6 +1023,7 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                 )
                 agent_free_at = decided
                 previewed_at = spawn_at  # the next piece shows as this one spawns
+                last_pause = delay
                 spawn_at += (timing["lock_frame"] + delay) / FPS
             best = max(cands, key=heuristic_value)
             agree += pick is best
@@ -1033,6 +1070,8 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             "nes_delays": args.nes_delays,
             "pipeline": args.pipeline,
             "static_state": args.static_state,
+            "movement": args.movement,
+            "tap_hz": args.tap_hz,
             "dense_board": args.dense_board,
             "heuristic_agreement": round(agree / max(1, placed), 3),
             "wall_s": round(time.monotonic() - t0, 1),
@@ -1056,7 +1095,15 @@ def main() -> None:
     )
     ap.add_argument(
         "--agent",
-        choices=["choice", "strategy", "score", "heuristic", "rules", "random"],
+        choices=[
+            "choice",
+            "strategy",
+            "score",
+            "heuristic",
+            "rules",
+            "pruned",
+            "random",
+        ],
         default="choice",
     )
     ap.add_argument("--url", default="http://127.0.0.1:8091", help="/v2 service")
@@ -1084,6 +1131,15 @@ def main() -> None:
         "--prune", action="store_true", help="ask only about non-dominated placements"
     )
     ap.add_argument("--compact", action="store_true", help="shorter option text")
+    ap.add_argument(
+        "--movement",
+        choices=["das", "charged", "tap"],
+        default="das",
+        help="real time: hold (NES DAS), pre-charged DAS, or tapping",
+    )
+    ap.add_argument(
+        "--tap-hz", type=float, default=15.0, help="presses per second when tapping"
+    )
     ap.add_argument(
         "--static-state",
         action="store_true",
