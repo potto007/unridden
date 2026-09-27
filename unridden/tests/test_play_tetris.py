@@ -20,8 +20,10 @@ from scripts.unridden.play_tetris import (
     Unridden,
     choose_choice,
     choose_score,
+    dominates,
     empty_board,
     placements,
+    prune,
     realtime_landing,
     run_game,
     strategy_filter,
@@ -128,6 +130,10 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         realtime=False,
         start_level=0,
         rules=False,
+        prune=False,
+        compact=False,
+        nes_delays=False,
+        pipeline=False,
     )
     result = run_game(args, FakeUnridden())
 
@@ -165,3 +171,48 @@ def test_strategy_rules_keep_the_well_for_tetrises() -> None:
     assert kept
     assert all(WELL not in {c for _, c in p.cells} for p in kept)
     assert all(p.features.new_holes == 0 for p in kept)
+
+
+def test_prune_keeps_only_non_dominated_placements() -> None:
+    board = empty_board()
+    cands = placements(board, "T")
+    kept = prune(cands)
+    assert 1 <= len(kept) < len(cands)
+    for p in cands:
+        if p not in kept:
+            assert any(dominates(q.features, p.features) for q in kept)
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_pipelining_gives_the_next_piece_a_head_start(
+    tmp_path: Path, pipeline: bool
+) -> None:
+    trace = tmp_path / "t.jsonl"
+    args = argparse.Namespace(
+        agent="choice",
+        url="http://fake",
+        seed=0,
+        max_pieces=12,
+        hints=False,
+        watch=False,
+        delay=0.0,
+        verbose=False,
+        trace=str(trace),
+        realtime=True,
+        start_level=0,
+        rules=False,
+        prune=False,
+        compact=True,
+        nes_delays=True,
+        pipeline=pipeline,
+    )
+    run_game(args, FakeUnridden())
+    moves = [json.loads(x) for x in trace.read_text().splitlines()][1:-1]
+    head = [m["realtime"]["head_start_ms"] for m in moves]
+    spawn = [m["realtime"]["spawn_s"] for m in moves]
+    assert head[0] == 0
+    assert all(h > 0 for h in head[1:]) if pipeline else all(h == 0 for h in head)
+    # A piece is visible only once the one before it spawns, so the head start
+    # never exceeds the previous piece's time on the board.
+    for i in range(1, len(moves)):
+        assert head[i] <= 1000 * (spawn[i] - spawn[i - 1]) + 0.1

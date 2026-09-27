@@ -238,6 +238,30 @@ def render_board(board: Board, highlight: Cells = ()) -> str:
     return "\n".join(lines)
 
 
+def dominates(a: Features, b: Features) -> bool:
+    """a is at least as good as b on every measure and better on one."""
+    va = (-a.lines, a.holes, a.agg_height, a.bumpiness)
+    vb = (-b.lines, b.holes, b.agg_height, b.bumpiness)
+    return va != vb and all(x <= y for x, y in zip(va, vb, strict=True))
+
+
+def prune(cands: list[Placement]) -> list[Placement]:
+    """Drop placements another placement beats on every measure; no weights."""
+    return [
+        p for p in cands if not any(dominates(q.features, p.features) for q in cands)
+    ]
+
+
+def describe_compact(p: Placement) -> str:
+    f = p.features
+    cols = sorted({c for _, c in p.cells})
+    span = f"col {cols[0]}" if len(cols) == 1 else f"cols {cols[0]}-{cols[-1]}"
+    return (
+        f"{span}: clears {f.lines}, {f.new_holes} new holes, height {f.max_height}, "
+        f"bumpiness {f.bumpiness}"
+    )
+
+
 def describe(p: Placement) -> str:
     f = p.features
     cols = sorted({c for _, c in p.cells})
@@ -329,6 +353,14 @@ GRAVITY += [2] * 10
 DAS_DELAY, DAS_REPEAT = 16, 6  # NES delayed auto shift, in frames
 
 
+LINE_CLEAR_FRAMES = 18  # NES line clear animation, about 17-20 frames
+
+
+def entry_delay(lock_height: int) -> int:
+    """NES entry delay: 10 frames low in the well, 2 more per 4 rows higher."""
+    return 10 + 2 * ((lock_height + 1) // 4)
+
+
 def frames_per_row(level: int) -> int:
     return GRAVITY[level] if level < len(GRAVITY) else 1
 
@@ -399,13 +431,15 @@ def realtime_landing(
                     fallen = top if frame < start else fallen
                 break
         frame += 1
+    cells = tuple(sorted((top + r, left + c) for r, c in shape))
     info = {
         "latency_ms": round(1000 * latency_s, 1),
         "frames_per_row": fpr,
         "rows_fallen_at_decision": fallen,
         "outcome": outcome,
+        "lock_frame": frame,
+        "lock_height": HEIGHT - max(r for r, _ in cells),
     }
-    cells = tuple(sorted((top + r, left + c) for r, c in shape))
     if cells == tuple(sorted(target.cells)):
         return target, info
     after, lines = drop(board, piece, cells)
@@ -560,13 +594,18 @@ def strategy_state(board: Board, piece: str, status: Status) -> str:
 
 
 def choose_choice(
-    client: Unridden, board: Board, piece: str, cands: list[Placement]
+    client: Unridden,
+    board: Board,
+    piece: str,
+    cands: list[Placement],
+    compact: bool = False,
 ) -> tuple[Placement, str, dict[str, Any]]:
     instructions = (
         f"Pick where to drop the {piece} piece. Prefer placements that clear "
         "lines, create no new holes, and keep the stack low and flat."
     )
-    return knockout(client, state_text(board, piece), instructions, cands, describe)
+    describe_fn = describe_compact if compact else describe
+    return knockout(client, state_text(board, piece), instructions, cands, describe_fn)
 
 
 def choose_strategy(
@@ -729,6 +768,11 @@ def choose(
     cands: list[Placement],
     status: Status,
 ) -> tuple[Placement, str, dict[str, Any]]:
+    if args.prune and args.agent not in ("heuristic", "random", "rules"):
+        kept = prune(cands)
+        if len(kept) == 1:
+            return kept[0], "pruned to one", {}
+        cands = kept
     if len(cands) == 1:  # forced; a Choice needs at least two options
         return cands[0], "forced", {}
     if args.agent == "random":
@@ -739,7 +783,7 @@ def choose(
     if args.agent == "heuristic" or client is None:
         return max(cands, key=heuristic_value), "", {}
     if args.agent == "choice":
-        return choose_choice(client, board, piece, cands)
+        return choose_choice(client, board, piece, cands, args.compact)
     if args.agent == "strategy":
         return choose_strategy(client, board, piece, cands, status, args.rules)
     return choose_score(client, board, piece, cands, args.hints)
@@ -837,6 +881,9 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
     upcoming = next(pieces)
     board = empty_board()
     lines = placed = agree = score = tetrises = since_i = missed = 0
+    # Simulated game clock in seconds (real-time mode). The agent may start on
+    # a piece once the board it lands on is known and the agent is free.
+    spawn_at = agent_free_at = previewed_at = 0.0
     t0 = time.monotonic()
     agent = args.agent + ("+hints" if args.agent == "score" and args.hints else "")
     with ExitStack() as stack:
@@ -877,8 +924,27 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             pick, note, _ = choice
             landed, timing = pick, None
             if args.realtime:
-                landed, timing = realtime_landing(board, pick, latency, level)
+                # Pipelined, the agent starts once it is free and the piece is in
+                # the one-piece preview, which happens when the previous piece
+                # spawns. Otherwise it starts when the piece itself spawns.
+                visible = previewed_at if args.pipeline else spawn_at
+                start = max(visible, agent_free_at)
+                decided = start + latency
+                late_by = max(0.0, decided - spawn_at)
+                landed, timing = realtime_landing(board, pick, late_by, level)
                 missed += landed is not pick
+                delay = 0
+                if args.nes_delays:
+                    delay = entry_delay(timing["lock_height"])
+                    delay += LINE_CLEAR_FRAMES if landed.features.lines else 0
+                timing.update(
+                    compute_ms=round(1000 * latency, 1),
+                    head_start_ms=round(1000 * (spawn_at - start), 1),
+                    spawn_s=round(spawn_at, 4),
+                )
+                agent_free_at = decided
+                previewed_at = spawn_at  # the next piece shows as this one spawns
+                spawn_at += (timing["lock_frame"] + delay) / FPS
             best = max(cands, key=heuristic_value)
             agree += pick is best
             score += nes_points(landed.features.lines, level)
@@ -919,6 +985,10 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             "realtime": args.realtime,
             "start_level": args.start_level,
             "missed_moves": missed,
+            "prune": args.prune,
+            "compact": args.compact,
+            "nes_delays": args.nes_delays,
+            "pipeline": args.pipeline,
             "heuristic_agreement": round(agree / max(1, placed), 3),
             "wall_s": round(time.monotonic() - t0, 1),
         }
@@ -962,6 +1032,20 @@ def main() -> None:
     )
     ap.add_argument(
         "--start-level", type=int, default=0, help="NES level (gravity, scoring)"
+    )
+    ap.add_argument(
+        "--prune", action="store_true", help="ask only about non-dominated placements"
+    )
+    ap.add_argument("--compact", action="store_true", help="shorter option text")
+    ap.add_argument(
+        "--nes-delays",
+        action="store_true",
+        help="real time: NES entry delay and line-clear pause between pieces",
+    )
+    ap.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="real time: start on the next piece as soon as the last decision is in",
     )
     ap.add_argument("--watch", action="store_true", help="redraw the board each move")
     ap.add_argument("--delay", type=float, default=0.0, help="seconds between moves")
