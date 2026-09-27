@@ -26,6 +26,10 @@ published measurements were taken on.
   (`capability_unavailable` otherwise); 26B clients sending 18/30 see no
   change. The final residual is tagged `raw_residual_after_final_block` and
   read as `which=final`. The worker bundle manifest lists `profiles`.
+  `validate_api_v2.py` reads the block counts from `/v2/models`, and
+  `qualify_snapshots.py` takes `--profile full-v1`; E2B and E4B pass its
+  release gates with bit-exact restores
+  ([results](docs/results/full-depth-snapshots.md)).
 
 ### Fixed
 
