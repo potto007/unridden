@@ -1,0 +1,132 @@
+"""CPU tests for the Tetris example's engine and its Unridden agents.
+
+The model is replaced by a fake that answers over the same /v2 request shapes.
+No test loads a model or touches the GPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from scripts.unridden.play_tetris import (
+    HEIGHT,
+    WIDTH,
+    Unridden,
+    choose_choice,
+    choose_score,
+    empty_board,
+    placements,
+    run_game,
+)
+
+
+class FakeUnridden(Unridden):
+    """Answers every Choice with its last option and scores by question order."""
+
+    def __init__(self) -> None:
+        super().__init__("http://fake")
+        self.decision_bodies: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
+
+    def _req(self, method: str, path: str, body: Any = None) -> Any:
+        out = self._answer(method, path, body)
+        self.exchanges.append(
+            {"method": method, "path": path, "request": body, "response": out}
+        )
+        return out
+
+    def _answer(self, method: str, path: str, body: Any) -> Any:
+        if method == "POST" and path == "/v2/snapshots":
+            return {"snapshots": [{"id": f"snap_{len(self.decision_bodies)}"}]}
+        if method == "DELETE":
+            self.deleted.append(path)
+            return None
+        assert path == "/v2/decisions"
+        self.decision_bodies.append(body)
+        answers: dict[str, Any] = {}
+        for index, (qid, question) in enumerate(body["questions"].items()):
+            if question["type"] == "choice":
+                keys = list(question["criteria"])
+                answers[qid] = {
+                    "type": "choice",
+                    "choice": keys[-1],
+                    "probabilities": {k: 1 / len(keys) for k in keys},
+                    "confidence": 1 / len(keys),
+                }
+            else:
+                answers[qid] = {
+                    "type": "score",
+                    "score": float(index),
+                    "probabilities": {},
+                    "legend": {},
+                    "confidence": 1.0,
+                }
+        return {"answers": answers, "usage": {"input_tokens": 10}}
+
+
+def test_empty_board_placement_counts() -> None:
+    counts = {p: len(placements(empty_board(), p)) for p in "IOTSZJL"}
+    assert counts == {"I": 17, "O": 9, "T": 34, "S": 17, "Z": 17, "J": 34, "L": 34}
+
+
+def test_horizontal_i_clears_the_bottom_row() -> None:
+    board = empty_board()
+    board[HEIGHT - 1] = ["."] * 4 + ["#"] * (WIDTH - 4)
+    flat = next(p for p in placements(board, "I") if p.key == "r0c0")
+    assert flat.features.lines == 1
+    assert all(ch == "." for row in flat.board for ch in row)
+
+
+def test_choice_runs_a_knockout_within_the_label_alphabet() -> None:
+    client = FakeUnridden()
+    cands = placements(empty_board(), "T")
+    pick, note, detail = choose_choice(client, empty_board(), "T", cands)
+
+    assert note.startswith("knockout")
+    assert [r["name"] for r in detail["rounds"]] == ["g0", "g1", "final"]
+    for body in client.decision_bodies:
+        for question in body["questions"].values():
+            assert 2 <= len(question["criteria"]) <= 26
+    # The fake picks each group's last option, then the second finalist.
+    assert pick.key == cands[-1].key
+    assert len(client.deleted) == 2
+
+
+def test_score_asks_one_question_per_placement_in_batches_of_32() -> None:
+    client = FakeUnridden()
+    cands = placements(empty_board(), "L")
+    pick, _, detail = choose_score(client, empty_board(), "L", cands, hints=False)
+
+    assert [len(b["questions"]) for b in client.decision_bodies] == [32, 2]
+    assert set(detail["scores"]) == {p.key for p in cands}
+    assert pick.key == cands[31].key  # highest index within the first batch
+
+
+@pytest.mark.parametrize("agent", ["choice", "score"])
+def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> None:
+    trace = tmp_path / "trace.jsonl"
+    args = argparse.Namespace(
+        agent=agent,
+        url="http://fake",
+        seed=3,
+        max_pieces=5,
+        hints=True,
+        watch=False,
+        delay=0.0,
+        verbose=False,
+        trace=str(trace),
+    )
+    result = run_game(args, FakeUnridden())
+
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert [r["type"] for r in rows] == ["game", *["move"] * 5, "result"]
+    assert rows[-1]["pieces"] == result["pieces"] == 5
+    for move in rows[1:-1]:
+        paths = [e["path"] for e in move["exchanges"]]
+        assert paths[0] == "/v2/snapshots"
+        assert move["pick"] in {c["key"] for c in move["candidates"]}
