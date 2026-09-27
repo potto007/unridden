@@ -259,6 +259,68 @@ def prune(cands: list[Placement]) -> list[Placement]:
     ]
 
 
+Plan = tuple[Placement, Placement]  # this piece, then the previewed piece
+
+
+def two_move_plans(
+    board: Board, piece: str, upcoming: str
+) -> tuple[list[Placement], dict[str, Plan]]:
+    """Every placement of this piece followed by every placement of the next.
+
+    Each plan is returned as a Placement whose key names both moves, whose
+    cells are the first move's, and whose features describe the board after
+    both, with lines summed. A first move after which the next piece has no
+    legal placement is left out.
+    """
+    base_holes = count_holes(board)
+    out: list[Placement] = []
+    parts: dict[str, Plan] = {}
+    for first in placements(board, piece):
+        for second in placements(first.board, upcoming):
+            f1, f2 = first.features, second.features
+            key = f"{first.key}+{second.key}"
+            out.append(
+                Placement(
+                    key=key,
+                    piece=piece,
+                    rotation=first.rotation,
+                    left=first.left,
+                    cells=first.cells,
+                    board=second.board,
+                    features=Features(
+                        lines=f1.lines + f2.lines,
+                        holes=f2.holes,
+                        new_holes=max(0, f2.holes - base_holes),
+                        agg_height=f2.agg_height,
+                        max_height=f2.max_height,
+                        bumpiness=f2.bumpiness,
+                        well_height=f2.well_height,
+                        well_height_before=f1.well_height_before,
+                        ready_rows=f2.ready_rows,
+                        ready_rows_before=f1.ready_rows_before,
+                        spread=f2.spread,
+                    ),
+                )
+            )
+            parts[key] = (first, second)
+    return out, parts
+
+
+def span_of(p: Placement) -> str:
+    cols = sorted({c for _, c in p.cells})
+    return f"col {cols[0]}" if len(cols) == 1 else f"cols {cols[0]}-{cols[-1]}"
+
+
+def describe_plan(plan: Placement, parts: dict[str, Plan]) -> str:
+    first, second = parts[plan.key]
+    f = plan.features
+    return (
+        f"now {span_of(first)}, then {second.piece} {span_of(second)}: "
+        f"clears {f.lines}, {f.new_holes} new holes, height {f.max_height}, "
+        f"bumpiness {f.bumpiness}"
+    )
+
+
 def describe_compact(p: Placement) -> str:
     f = p.features
     cols = sorted({c for _, c in p.cells})
@@ -506,9 +568,10 @@ class BudgetError(RuntimeError):
 
 
 class Unridden:
-    def __init__(self, base: str, timeout: float = 60.0) -> None:
+    def __init__(self, base: str, timeout: float = 60.0, api: str = "v2") -> None:
         self.base = base.rstrip("/")
         self.timeout = timeout
+        self.api = api  # v2: snapshots then decisions; v1: one /v1/decisions call
         self.calls = 0
         self.tokens = 0
         self.seconds = 0.0
@@ -557,6 +620,17 @@ class Unridden:
     ) -> dict[str, Any]:
         """Answer questions over state. keep reuses one snapshot of a fixed state."""
         start = time.monotonic()
+        if self.api == "v1":  # the whole prompt in one request; no snapshots
+            answers_v1: dict[str, Any] = {}
+            items_v1 = list(questions.items())
+            for i in range(0, len(items_v1), 32):
+                body = {"state": state, "questions": dict(items_v1[i : i + 32])}
+                resp = self._req("POST", "/v1/decisions", body)
+                answers_v1.update(resp["answers"])
+                self.tokens += resp["usage"]["input_tokens"]
+                self.calls += 1
+            self.seconds += time.monotonic() - start
+            return answers_v1
         snap_id = self.kept.get(state) if keep else None
         if snap_id is None:
             snap = self._req(
@@ -650,12 +724,22 @@ def choose_choice(
     compact: bool = False,
     static_state: bool = False,
     dense: bool = False,
+    plan_parts: dict[str, Plan] | None = None,
 ) -> tuple[Placement, str, dict[str, Any]]:
     instructions = (
         f"Pick where to drop the {piece} piece. Prefer placements that clear "
         "lines, create no new holes, and keep the stack low and flat."
     )
-    describe_fn = describe_compact if compact else describe
+    describe_fn: Callable[[Placement], str] = describe_compact if compact else describe
+    if plan_parts is not None:
+        parts = plan_parts
+        upcoming = next(iter(parts.values()))[1].piece
+        instructions = (
+            f"Pick a two-move plan: where to drop the {piece} piece now and the "
+            f"next {upcoming} piece after it. Prefer plans that clear lines, "
+            "create no new holes, and keep the stack low and flat."
+        )
+        describe_fn = lambda p: describe_plan(p, parts)  # noqa: E731
     if static_state:
         # The rules are the state and stay prefilled for the whole game; the
         # board travels in the question, so a move is one decisions call.
@@ -830,6 +914,8 @@ def choose(
     cands: list[Placement],
     status: Status,
 ) -> tuple[Placement, str, dict[str, Any]]:
+    if args.lookahead and args.agent in ("choice", "pruned"):
+        return choose_plan(args, client, rng, board, piece, status)
     if args.prune and args.agent not in ("heuristic", "random", "rules"):
         kept = prune(cands)
         if len(kept) == 1:
@@ -859,6 +945,47 @@ def choose(
     if args.agent == "strategy":
         return choose_strategy(client, board, piece, cands, status, args.rules)
     return choose_score(client, board, piece, cands, args.hints)
+
+
+def choose_plan(
+    args: argparse.Namespace,
+    client: Unridden | None,
+    rng: random.Random,
+    board: Board,
+    piece: str,
+    status: Status,
+) -> tuple[Placement, str, dict[str, Any]]:
+    """Choose a two-move plan, then play only its first move (receding horizon).
+
+    Plans are always pruned to the non-dominated set; there are up to ~1,000.
+    """
+    plans, parts = two_move_plans(board, piece, status.next_piece)
+    if not plans:  # no first move leaves room for the next piece
+        cands = placements(board, piece)
+        return max(cands, key=heuristic_value), "no plan survives", {}
+    kept = prune(plans)
+    detail: dict[str, Any] = {"plans": len(plans), "kept": [p.key for p in kept]}
+    if len(kept) == 1:
+        plan = kept[0]
+        return parts[plan.key][0], "plan pruned to one", detail | {"plan": plan.key}
+    if args.agent == "pruned" or client is None:
+        plan = rng.choice(kept)
+        return parts[plan.key][0], "plan, random", detail | {"plan": plan.key}
+    chosen, note, more = choose_choice(
+        client,
+        board,
+        piece,
+        kept,
+        args.compact,
+        args.static_state,
+        args.dense_board,
+        plan_parts=parts,
+    )
+    return (
+        parts[chosen.key][0],
+        f"plan {chosen.key}, {note}",
+        detail | more | {"plan": chosen.key},
+    )
 
 
 def move_record(
@@ -943,7 +1070,7 @@ def show(
 
 def play(args: argparse.Namespace) -> dict[str, Any]:
     model_agents = ("choice", "strategy", "score")
-    client = Unridden(args.url) if args.agent in model_agents else None
+    client = Unridden(args.url, api=args.api) if args.agent in model_agents else None
     return run_game(args, client)
 
 
@@ -1026,7 +1153,7 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                 last_pause = delay
                 spawn_at += (timing["lock_frame"] + delay) / FPS
             best = max(cands, key=heuristic_value)
-            agree += pick is best
+            agree += pick.key == best.key
             score += nes_points(landed.features.lines, level)
             tetrises += landed.features.lines == 4
             since_i = 0 if piece == "I" else since_i + 1
@@ -1071,6 +1198,7 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             "pipeline": args.pipeline,
             "static_state": args.static_state,
             "movement": args.movement,
+            "lookahead": args.lookahead,
             "tap_hz": args.tap_hz,
             "dense_board": args.dense_board,
             "heuristic_agreement": round(agree / max(1, placed), 3),
@@ -1106,7 +1234,13 @@ def main() -> None:
         ],
         default="choice",
     )
-    ap.add_argument("--url", default="http://127.0.0.1:8091", help="/v2 service")
+    ap.add_argument("--url", default="http://127.0.0.1:8091", help="service base URL")
+    ap.add_argument(
+        "--api",
+        choices=["v2", "v1"],
+        default="v2",
+        help="v2 snapshots service (:8091) or the plain v1 service",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-pieces", type=int, default=200)
     ap.add_argument(
@@ -1131,6 +1265,11 @@ def main() -> None:
         "--prune", action="store_true", help="ask only about non-dominated placements"
     )
     ap.add_argument("--compact", action="store_true", help="shorter option text")
+    ap.add_argument(
+        "--lookahead",
+        action="store_true",
+        help="choice/pruned: choose among two-move plans using the preview",
+    )
     ap.add_argument(
         "--movement",
         choices=["das", "charged", "tap"],

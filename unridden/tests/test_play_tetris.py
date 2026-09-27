@@ -28,6 +28,7 @@ from scripts.unridden.play_tetris import (
     run_game,
     shift_frames,
     strategy_filter,
+    two_move_plans,
 )
 
 
@@ -139,6 +140,7 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
         dense_board=False,
         movement="das",
         tap_hz=15.0,
+        lookahead=False,
     )
     result = run_game(args, FakeUnridden())
 
@@ -214,6 +216,7 @@ def test_pipelining_gives_the_next_piece_a_head_start(
         dense_board=False,
         movement="das",
         tap_hz=15.0,
+        lookahead=False,
     )
     run_game(args, FakeUnridden())
     moves = [json.loads(x) for x in trace.read_text().splitlines()][1:-1]
@@ -250,6 +253,7 @@ def test_static_state_keeps_one_snapshot_for_the_game(tmp_path: Path) -> None:
         dense_board=True,
         movement="das",
         tap_hz=15.0,
+        lookahead=False,
     )
     run_game(args, client)
     used = {body["snapshot"]["id"] for body in client.decision_bodies}
@@ -277,3 +281,51 @@ def test_tapping_reaches_a_target_holding_cannot_at_level_29() -> None:
     tapped, _ = realtime_landing(board, target, 0.0, 29, "tap", tap_hz=15.0)
     assert held is not target and held_info["outcome"] != "on time"
     assert tapped is target
+
+
+def test_lookahead_plays_the_first_move_of_a_two_move_plan() -> None:
+    board = empty_board()
+    plans, parts = two_move_plans(board, "T", "I")
+    assert len(plans) == len(parts) > 100
+    kept = prune(plans)
+    assert 1 <= len(kept) <= 26
+    first, second = parts[kept[0].key]
+    assert kept[0].key == f"{first.key}+{second.key}"
+    assert kept[0].board == second.board  # features describe the board after both
+    assert first.key in {p.key for p in placements(board, "T")}
+
+
+def test_lookahead_choice_asks_about_plans(tmp_path: Path) -> None:
+    client = FakeUnridden()
+    trace = tmp_path / "t.jsonl"
+    args = argparse.Namespace(
+        agent="choice",
+        url="http://fake",
+        seed=0,
+        max_pieces=6,
+        hints=False,
+        watch=False,
+        delay=0.0,
+        verbose=False,
+        trace=str(trace),
+        realtime=False,
+        start_level=0,
+        rules=False,
+        prune=True,
+        compact=True,
+        nes_delays=False,
+        pipeline=False,
+        static_state=True,
+        dense_board=True,
+        movement="das",
+        tap_hz=15.0,
+        lookahead=True,
+    )
+    run_game(args, client)
+    for body in client.decision_bodies:
+        for question in body["questions"].values():
+            assert "two-move plan" in question["instructions"]
+            assert all("+" in key for key in question["criteria"])
+    moves = [json.loads(x) for x in trace.read_text().splitlines()][1:-1]
+    for m in moves:
+        assert m["pick"] in {c["key"] for c in m["candidates"]}

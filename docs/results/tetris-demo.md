@@ -199,6 +199,65 @@ Seeds 0 and 1, 300-piece cap, all real-time flags. Unridden used
   options topped out by piece 92 in every real-time game above, and at 68 and
   95 pieces turn-based, where the model survives 300.
 
+## Lookahead: two-move plans
+
+`--lookahead` makes the model choose a plan instead of a single move. The
+engine lists every placement of the current piece followed by every placement
+of the previewed piece (a median of about 470 plans) and prunes them by the
+same no-weights dominance rule, leaving a median of 3 (max 15). The model
+picks among lines like `now cols 3-5, then I col 9: clears 4, 0 new holes,
+height 3, bumpiness 2`. Only the first move is played; the next turn plans
+again with the new preview. Building the plans costs 19 ms of CPU at the
+median (53 ms at p95), inside the measured decision time.
+
+Snapshots service, `--prune --compact --static-state --dense-board`, 30 Hz
+tapping for the real-time rows. Pieces and score:
+
+| Mode | Seed | Lookahead | Single move | Random plan |
+| --- | --- | --- | --- | --- |
+| turn-based | 0 | 300, 34,400 | 300, 49,340 | - |
+| turn-based | 1 | 300, 33,140 | 300, 37,060 | - |
+| level 18 | 0 | 300, 99,560 | 300, 136,040 | 72, 11,020 |
+| level 18 | 1 | 300, 97,660 | 300, 119,700 | 71, 9,880 |
+| level 29 | 0 | **300, 157,200** | 171, 70,200 | 66, 16,200 |
+| level 29 | 1 | 300, 154,200 | 300, 189,000 | 54, 9,600 |
+
+Lookahead survived every game, including both seeds at level 29, but scored
+less wherever both survived. It took no Tetrises; the single-move games took
+1-2 per seed. It trades greed for safety. Decision time rose from 32-40 ms to
+57-61 ms.
+
+## Model size: 26B-A4B, 12B, E4B
+
+The snapshots worker is built for the 26B-A4B's shape, so this comparison runs
+all three Gemma 4 instruction-tuned models, each UD-Q4_K_XL from
+`unsloth/gemma-4-*-GGUF`, on the same v1 worker (`--api v1`). There is one
+request per question, no snapshots, and one model on the GPU at a time. Same
+flags as above. Pieces and score for seeds 0 / 1, then mean decision time:
+
+| Setup | 26B-A4B | 12B | E4B |
+| --- | --- | --- | --- |
+| single move, turn-based | 300 / 300, 42,340 / 45,180, 65 ms | 159 / 183, 7,640 / 7,660, 66 ms | 300 / 120, 35,380 / 2,720, 46 ms |
+| single move, level 18 | 300 / 300, 137,940 / 135,280 | 62 / 73, 7,600 / 12,160 | 300 / 105, 104,120 / 22,800 |
+| single move, level 29 | 300 / 86, 217,800 / 26,400 | 58 / 59, 12,000 / 14,400 | 231 / 53, 111,600 / 12,600 |
+| lookahead, turn-based | 300 / 300, 33,400 / 31,900, 98 ms | 300 / 300, 31,560 / 31,960, 96 ms | 300 / 300, 31,580 / 32,900, 74 ms |
+| lookahead, level 18 | 300 / 300, 97,280 / 95,000 | 300 / 300, 94,240 / 94,240 | 300 / 300, 94,620 / 97,660 |
+| lookahead, level 29 | 300 / 300, 153,600 / 150,000 | 300 / 300, 148,800 / 148,800 | 115 / 300, 40,800 / 154,200 |
+
+- Choosing single moves takes the big model. Of the 6 single-move games, the
+  26B-A4B survived 5, the E4B 2 and the 12B none.
+- Lookahead makes size matter much less. All three survived every lookahead
+  game except one E4B seed at level 29, with scores within about 6% of each
+  other. The plans carry the consequences the smaller models cannot infer,
+  and random plans still top out by piece 72, so the choice still matters.
+- The 12B is no faster than the 26B-A4B here (65 vs 66 ms). The MoE activates
+  about 4B parameters per token, so the dense 12B does more work per token.
+  The E4B is about 30% faster (46 ms).
+- On v1 every request prefills the whole prompt, so it is slower than the
+  snapshots path with `--static-state` (65 vs 32-40 ms for the 26B-A4B). The
+  26B-A4B's v1 games also differ from its snapshot games move by move: the
+  two runtimes are numerically different, deterministic within each.
+
 ## Reproduce
 
 ```bash
