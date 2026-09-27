@@ -301,16 +301,18 @@ class SnapshotService:
             )
             wants_final = profile.final_block in request.checkpoints
             labels = compiled.labels if (wants_final and compiled.labels) else None
+            # Nothing to reclaim if this fails: the worker publishes a create
+            # only once it completes, and a transport failure reaps the worker.
+            result = await self._backend.create(
+                messages=compiled.messages,
+                answer_prefix=compiled.answer_prefix,
+                freeze=freeze,
+                checkpoints=checkpoints,
+                labels=labels,
+                top_logits=0,
+                timeout=self._request_timeout,
+            )
             try:
-                result = await self._backend.create(
-                    messages=compiled.messages,
-                    answer_prefix=compiled.answer_prefix,
-                    freeze=freeze,
-                    checkpoints=checkpoints,
-                    labels=labels,
-                    top_logits=0,
-                    timeout=self._request_timeout,
-                )
                 returned = {row.snapshot_id for row in result.snapshots}
                 if returned != requested_ids:
                     raise SnapshotProtocolError(
@@ -367,12 +369,13 @@ class SnapshotService:
         with store.lease(record.id):
             await store.restore(record.id)
             new_id = new_snapshot_id()
+            # As for create: a failed promote leaves nothing in the worker.
+            promoted = await self._backend.promote(
+                snapshot_id=record.id,
+                new_id=new_id,
+                timeout=self._request_timeout,
+            )
             try:
-                promoted = await self._backend.promote(
-                    snapshot_id=record.id,
-                    new_id=new_id,
-                    timeout=self._request_timeout,
-                )
                 if promoted.snapshot.snapshot_id != new_id:
                     raise SnapshotProtocolError("promotion returned an unexpected id")
                 await store.register(

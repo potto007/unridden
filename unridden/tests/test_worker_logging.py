@@ -14,7 +14,7 @@ import pytest
 from unridden.api.cli import configure_logging
 from unridden.api.native_backend import worker_line_level
 from unridden.api.snapshots.backend import SnapshotNativeBackend
-from unridden.api.snapshots.errors import SnapshotExecutionError
+from unridden.api.snapshots.errors import SnapshotExecutionError, SnapshotRequestError
 from unridden.tests.test_snapshots_app import (
     CONTEXT_BODY,
     FakeSnapshotBackend,
@@ -81,6 +81,32 @@ async def test_a_500_logs_its_cause(
         in record.getMessage()
         for record in caplog.records
     )
+
+
+class RefusingCreate(FakeSnapshotBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drops: list[str] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        raise SnapshotRequestError("prompt exceeds context", reason="budget")
+
+    async def drop(self, snapshot_id: str) -> int:
+        self.drops.append(snapshot_id)
+        return await super().drop(snapshot_id)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_create_sends_no_cleanup_drop(tmp_path: Path) -> None:
+    # The worker created nothing, so a drop would only log a spurious
+    # snapshot_not_found warning next to the real refusal.
+    backend = RefusingCreate()
+    async with client_for(backend, tmp_path) as client:
+        response = await client.post("/v2/snapshots", json=CONTEXT_BODY)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "budget_error"
+    assert backend.drops == []
 
 
 @pytest.fixture

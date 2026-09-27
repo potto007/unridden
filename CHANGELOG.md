@@ -38,6 +38,8 @@ published measurements were taken on.
   llama.cpp log; worker failure lines (`REQUEST_FAILED`, `PREFLIGHT_FAILED`,
   `WORKER_FAILED`) log as warnings instead of debug, and every 5xx logs its
   underlying error. Before, a worker-side failure showed only as a bare 500.
+  A refused create or promote no longer sends a cleanup drop for ids the
+  worker never created, so its refusal is the only warning logged.
 - `persistence: "disk"` no longer fails with a 500 when the store directory
   is relative (the default `build/snapshots`, as the systemd units use): the
   store resolves its root, since the worker only saves to and loads from
