@@ -158,6 +158,47 @@ level 18 lasted 154 and 117 pieces (41,420 and 50,160 points). The earlier
 runs had no late moves either, so those differences come from different
 choices, not from speed.
 
+## Movement: holding, pre-charged, tapping
+
+`--movement` sets how the simulated player moves the piece:
+
+- `das` holds the direction on NES auto-shift: one column at once, the next
+  after 16 frames, then one every 6.
+- `charged` holds the direction during the entry delay before the piece
+  spawns. NES keeps counting then, so a full charge moves every 6 frames from
+  frame 0. It needs the decision in before the spawn, which `--pipeline`
+  provides, and the charge is capped by the pause and by the head start.
+- `tap` presses repeatedly at `--tap-hz`, one column per press, with no
+  repeat delay. 15 Hz is a fast human; 30 Hz is the limit (a press plus a
+  release is 2 frames) and about what top players reach by rolling.
+
+A new `pruned` agent picks at random among the non-dominated placements. It
+shows what the model adds beyond pruning.
+
+Seeds 0 and 1, 300-piece cap, all real-time flags. Unridden used
+`--prune --compact --static-state --dense-board`. Pieces and score:
+
+| Level | Movement | Unridden | Heuristic (no latency) | Pruned, random |
+| --- | --- | --- | --- | --- |
+| 18 | das | 154, 41,420 / 117, 50,160 | 210, 57,000 / 152, 38,380 | 30, 1,900 / 47, 8,360 |
+| 18 | charged | 156, 41,420 / **300, 119,700** | 227, 60,800 / 281, 77,140 | 54, 7,220 / 71, 11,400 |
+| 18 | tap 15 Hz | 167, 42,940 / **300, 119,700** | 283, 77,140 / 284, 77,140 | 57, 7,220 / 76, 12,920 |
+| 18 | tap 30 Hz | **300, 136,040 / 300, 119,700** | 300, 87,400 / 300, 89,300 | 66, 8,740 / 92, 17,100 |
+| 29 | das | 17, 0 / 18, 0 | 16, 0 / 16, 0 | 18, 0 / 10, 0 |
+| 29 | tap 15 Hz | 19, 1,200 / 47, 16,200 | 17, 1,200 / 40, 13,800 | 25, 0 / 34, 6,000 |
+| 29 | tap 30 Hz | 171, 70,200 / **300, 189,000** | 248, 105,600 / 281, 121,800 | 54, 11,400 / 71, 18,000 |
+
+- Movement was the level-18 bottleneck. Tapping at 30 Hz took Unridden from
+  154 and 117 pieces to the 300 cap on both seeds, with no missed moves. It
+  survived level 29, where a piece falls a row every frame, on one seed.
+- Unridden outscores the no-latency heuristic whenever both survive. At level
+  18 with 30 Hz tapping it cleared 2 and 1 Tetrises and 10 and 9 doubles
+  across the two seeds; the heuristic cleared no Tetrises and 5 and 4
+  doubles. Each Tetris is worth 1,200 × 19 there.
+- Choosing among the pruned options matters. Random picks among the same
+  options topped out by piece 92 in every real-time game above, and at 68 and
+  95 pieces turn-based, where the model survives 300.
+
 ## Reproduce
 
 ```bash
