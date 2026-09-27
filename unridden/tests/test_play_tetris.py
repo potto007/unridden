@@ -35,10 +35,12 @@ from scripts.unridden.play_tetris import (
 class FakeUnridden(Unridden):
     """Answers every Choice with its last option and scores by question order."""
 
-    def __init__(self) -> None:
+    def __init__(self, readout_block: int = 30) -> None:
         super().__init__("http://fake")
         self.decision_bodies: list[dict[str, Any]] = []
+        self.snapshot_bodies: list[dict[str, Any]] = []
         self.deleted: list[str] = []
+        self.readout_block = readout_block
 
     def _req(self, method: str, path: str, body: Any = None) -> Any:
         out = self._answer(method, path, body)
@@ -48,7 +50,18 @@ class FakeUnridden(Unridden):
         return out
 
     def _answer(self, method: str, path: str, body: Any) -> Any:
+        if method == "GET" and path == "/v2/models":
+            block = self.readout_block
+            return {
+                "models": [
+                    {
+                        "limits": {"checkpoints": [block]},
+                        "capabilities": {"readout_blocks": [block]},
+                    }
+                ]
+            }
         if method == "POST" and path == "/v2/snapshots":
+            self.snapshot_bodies.append(body)
             return {"snapshots": [{"id": f"snap_{len(self.decision_bodies)}"}]}
         if method == "DELETE":
             self.deleted.append(path)
@@ -116,6 +129,21 @@ def test_score_asks_one_question_per_placement_in_batches_of_32() -> None:
     assert pick.key == cands[31].key  # highest index within the first batch
 
 
+@pytest.mark.parametrize("block", [30, 35, 42])
+def test_snapshots_use_the_servers_readout_block(block: int) -> None:
+    # 26B split profile reads out at 30; full-v1 at the block count (E2B 35,
+    # E4B 42). The client asks /v2/models once instead of assuming 30.
+    client = FakeUnridden(readout_block=block)
+    cands = placements(empty_board(), "T")
+    choose_choice(client, empty_board(), "T", cands)
+    choose_choice(client, empty_board(), "T", cands)
+
+    assert {tuple(b["checkpoints"]) for b in client.snapshot_bodies} == {(block,)}
+    assert {b["readout"]["completed_blocks"] for b in client.decision_bodies} == {block}
+    lookups = [e for e in client.exchanges if e["path"] == "/v2/models"]
+    assert len(lookups) == 1
+
+
 @pytest.mark.parametrize("agent", ["choice", "score"])
 def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> None:
     trace = tmp_path / "trace.jsonl"
@@ -147,9 +175,11 @@ def test_trace_records_every_move_and_exchange(tmp_path: Path, agent: str) -> No
     rows = [json.loads(line) for line in trace.read_text().splitlines()]
     assert [r["type"] for r in rows] == ["game", *["move"] * 5, "result"]
     assert rows[-1]["pieces"] == result["pieces"] == 5
-    for move in rows[1:-1]:
+    for number, move in enumerate(rows[1:-1]):
         paths = [e["path"] for e in move["exchanges"]]
-        assert paths[0] == "/v2/snapshots"
+        # The profile's readout block is looked up once, before the first move.
+        first = ["/v2/models", "/v2/snapshots"] if number == 0 else ["/v2/snapshots"]
+        assert paths[: len(first)] == first
         assert move["pick"] in {c["key"] for c in move["candidates"]}
 
 

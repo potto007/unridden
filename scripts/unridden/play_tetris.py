@@ -578,6 +578,20 @@ class Unridden:
         self.exchanges: list[dict[str, Any]] = []  # raw HTTP log for the trace
         self.pending: list[str] = []  # snapshot ids awaiting deletion
         self.kept: dict[str, str] = {}  # fixed state -> snapshot id, for the game
+        self._final_block: int | None = None
+
+    def final_block(self) -> int:
+        """The block the server's snapshot profile reads out at, asked once.
+
+        30 on the 26B split profile, the model's block count on full-v1
+        (42 for E4B, 35 for E2B).
+        """
+        if self._final_block is None:
+            models = self._req("GET", "/v2/models")
+            self._final_block = int(
+                models["models"][0]["capabilities"]["readout_blocks"][0]
+            )
+        return self._final_block
 
     def _req(self, method: str, path: str, body: Any = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
@@ -619,6 +633,8 @@ class Unridden:
         self, state: str, questions: dict[str, Any], keep: bool = False
     ) -> dict[str, Any]:
         """Answer questions over state. keep reuses one snapshot of a fixed state."""
+        # Off the clock: one lookup per game, not part of any move.
+        final = self.final_block() if self.api != "v1" else 0
         start = time.monotonic()
         if self.api == "v1":  # the whole prompt in one request; no snapshots
             answers_v1: dict[str, Any] = {}
@@ -638,7 +654,7 @@ class Unridden:
                 "/v2/snapshots",
                 {
                     "input": {"kind": "context", "state": state},
-                    "checkpoints": [30],
+                    "checkpoints": [final],
                     "persistence": "memory",
                     "ttl_seconds": 3600 if keep else 300,
                 },
@@ -658,7 +674,7 @@ class Unridden:
                 {
                     "snapshot": {"id": snap_id, "relationship": "followup"},
                     "questions": dict(items[i : i + 32]),
-                    "readout": {"completed_blocks": 30},
+                    "readout": {"completed_blocks": final},
                 },
             )
             answers.update(resp["answers"])
