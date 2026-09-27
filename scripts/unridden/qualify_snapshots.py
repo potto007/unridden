@@ -143,7 +143,8 @@ class Worker:
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=open("/tmp/unridden-snapshot-worker.stderr.log", "ab"),  # noqa: SIM115
+            # The worker is llama.cpp: its canonical log, which promtail tails.
+            stderr=open("/tmp/llama-server.log", "ab"),  # noqa: SIM115
             env=environment,
         )
         self.hello = self._read()
@@ -160,7 +161,7 @@ class Worker:
         assert self.process.stdout is not None
         line = self.process.stdout.readline()
         if not line:
-            raise RuntimeError("worker closed stdout; see its stderr log")
+            raise RuntimeError("worker closed stdout; see /tmp/llama-server.log")
         payload: Row = json.loads(line)
         return payload
 
