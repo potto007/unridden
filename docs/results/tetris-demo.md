@@ -99,6 +99,38 @@ Seeds 0 and 1, 300-piece cap, same service as above:
   a second, so 300 ms of reading is 6 rows before it moves. The instant
   heuristic lasts 210 pieces there; the model lasts 15-17.
 
+## Latency optimizations
+
+Four flags cut the decision time and use the game's own pauses:
+
+- `--prune` offers only placements no other placement beats or ties on every
+  measure (lines, holes, aggregate height, bumpiness), with no weights. On
+  recorded boards the median set is 2 options (max 9), and a quarter of moves
+  need no call.
+- `--compact` shortens the option text.
+- `--nes-delays` adds the NES entry delay and line-clear pause.
+- `--pipeline` starts on the previewed piece as soon as the agent is free,
+  capped by the one-piece preview.
+
+Plain prompt, seeds 0 and 1, 300-piece cap:
+
+| Setup | Mode | Seed 0 | Seed 1 | Decision p50 |
+| --- | --- | --- | --- | --- |
+| all four | turn-based | 300 pieces, 39,040 pts | 300, 32,540 | 86 ms |
+| all four | real time from level 0 | 300, 39,040, 0 late | 300, 32,540, 0 late | 86 ms |
+| all four | real time from level 18 | 179, 75,240 | 51, 7,980 | 86 ms |
+| delays only | real time from level 18 | 17, 1,520 | 17, 0 | 240 ms |
+| delays + pipeline | real time from level 18 | 27, 1,520 | 43, 7,220 | 234 ms |
+
+- With all four, no move was late: 86 ms fits inside the median 0.5 s head
+  start. At level 0 the real-time games were move-for-move identical to the
+  turn-based ones.
+- Pipelining without pruning is not enough: at 234 ms, 14 of 68 moves were
+  still late at level 18.
+- At level 18 the model still misses 4-6 moves a game. NES auto-shift cannot
+  carry a piece across the board at 3 frames per row, and the zero-latency
+  heuristic misses 8 there too.
+
 ## Reproduce
 
 ```bash
