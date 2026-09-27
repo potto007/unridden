@@ -58,6 +58,47 @@ hints and 60 for board-only score.
 - Reading the drawn board alone is at the level of random play: 38 holes after
   15 pieces.
 
+These games split more than 26 placements into contiguous halves. The engine
+now splits them into interleaved groups, and a split that exceeds the context
+is split again. That changes individual games: Unridden's plain Choice agent on
+seed 0, which survived 500 pieces above, topped out at piece 286 with 98 lines
+after the change.
+
+## High-score goals and real time
+
+The engine now scores NES points: 40, 100, 300 and 1200 for 1-4 lines, times
+(level + 1). It also shows the next piece and has two further modes.
+
+- `--agent strategy` puts the scoring goal and a standard high-score strategy
+  in the state: keep column 9 as a Tetris well, stack flat, burn only when
+  high, use the next piece. It describes each placement in those terms.
+  `--rules` also enforces that strategy's hard rules in code before asking.
+- `--realtime --start-level N`: the piece falls at NES gravity while the
+  agent decides, then rotates, shifts on NES auto-shift timing and
+  hard-drops. A late or blocked move locks wherever the piece is.
+
+Seeds 0 and 1, 300-piece cap, same service as above:
+
+| Agent | Mode | Seed 0 | Seed 1 | ms/move |
+| --- | --- | --- | --- | --- |
+| choice | turn-based | 286 pieces, 23,860 pts | 300, 30,240 | 300-336 |
+| choice | real time from level 0 | 145, 5,600 | 271, 25,400 | 298-327 |
+| choice | real time from level 18 | 17, 1,520 | 16, 0 | 312-318 |
+| strategy | turn-based | 143, 6,980 | 48, 140 | 438-509 |
+| strategy | real time from level 0 | 122, 6,180 | 41, 100 | 485-523 |
+| heuristic | real time from level 0, seed 0 | 283, 22,060 | - | ~0 |
+| heuristic | real time from level 18, seed 0 | 210, 57,000 | - | ~0 |
+
+- The high-score strategy did not help. As text it scored below the plain
+  prompt. Enforcing its rules in code was worse: a 200-piece trial topped
+  out at piece 122, and random choices within the same rules lasted 89-141
+  pieces. With hard drops only, holding a column open for Tetrises costs more
+  than it earns. Both of this matrix's Tetrises came from the strategy agent
+  on seed 0.
+- Real time costs the model through latency: at level 18 a piece falls 20 rows
+  a second, so 300 ms of reading is 6 rows before it moves. The instant
+  heuristic lasts 210 pieces there; the model lasts 15-17.
+
 ## Reproduce
 
 ```bash

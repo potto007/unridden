@@ -7,11 +7,18 @@ prefilled once as a /v2 context snapshot and the questions branch from it.
 Agents:
   choice     one Choice question per group of <=26 placements; each option is
              described by its outcome (lines, holes, height, bumpiness). More
-             than 26 placements run a two-round knockout.
+             than 26 placements run as groups plus a final.
+  strategy   like choice, with NES scoring and a high-score strategy (Tetris
+             well, flat stack, burn only when high) in the state; --rules
+             also enforces that strategy's hard rules before asking.
   score      one Score question per placement with the resulting board drawn;
              the placement with the highest expected score wins.
   heuristic  fixed linear evaluator (Yiyuan Lee weights), no model.
+  rules      the strategy's hard rules, then a uniform pick; no model.
   random     uniform over placements, no model.
+
+--realtime makes the piece fall at NES gravity (--start-level) while the agent
+decides; a late decision locks the piece wherever it has fallen.
 
 Stdlib only; talks HTTP to the /v2 snapshots service (`serve --snapshots`,
 :8091 by default). `--trace` writes every move and HTTP exchange as JSONL for
@@ -22,12 +29,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -82,6 +90,18 @@ def fits(board: Board, cells: Cells, top: int, left: int) -> bool:
     return True
 
 
+WELL = WIDTH - 1  # the strategy agent keeps the rightmost column open
+
+# NES scoring: base points per clear, multiplied by (level + 1); the level
+# rises every 10 lines from level 0.
+NES_POINTS = {0: 0, 1: 40, 2: 100, 3: 300, 4: 1200}
+CLEAR_NAMES = {1: "single", 2: "double", 3: "triple", 4: "TETRIS"}
+
+
+def nes_points(lines: int, level: int) -> int:
+    return NES_POINTS[lines] * (level + 1)
+
+
 @dataclass(frozen=True)
 class Features:
     lines: int
@@ -90,6 +110,11 @@ class Features:
     agg_height: int
     max_height: int
     bumpiness: int
+    well_height: int  # height of the well column after the move
+    well_height_before: int
+    ready_rows: int  # rows open to the well with columns 0-8 full
+    ready_rows_before: int
+    spread: int  # highest minus lowest of columns 0-8
 
 
 @dataclass
@@ -127,9 +152,16 @@ def count_holes(board: Board) -> int:
     return holes
 
 
+def ready_rows(board: Board) -> int:
+    """Rows an I piece dropped in the well would reach that need only the well."""
+    top = HEIGHT - column_heights(board)[WELL]
+    return sum(1 for r in range(top) if all(board[r][c] != "." for c in range(WELL)))
+
+
 def features_of(before: Board, after: Board, lines: int) -> Features:
     heights = column_heights(after)
     holes = count_holes(after)
+    stack = heights[:WELL]
     return Features(
         lines=lines,
         holes=holes,
@@ -137,6 +169,11 @@ def features_of(before: Board, after: Board, lines: int) -> Features:
         agg_height=sum(heights),
         max_height=max(heights),
         bumpiness=sum(abs(a - b) for a, b in zip(heights, heights[1:], strict=False)),
+        well_height=heights[WELL],
+        well_height_before=column_heights(before)[WELL],
+        ready_rows=ready_rows(after),
+        ready_rows_before=ready_rows(before),
+        spread=max(stack) - min(stack),
     )
 
 
@@ -212,6 +249,178 @@ def describe(p: Placement) -> str:
     )
 
 
+@dataclass(frozen=True)
+class Status:
+    """What a player sees beside the board: score, level and the preview."""
+
+    score: int
+    level: int
+    lines: int
+    next_piece: str
+    since_i: int  # pieces placed since the last I
+
+
+DANGER_HEIGHT = 12
+
+
+def describe_strategic(p: Placement, status: Status) -> str:
+    """The outcome of a placement in the terms the strategy is written in."""
+    f = p.features
+    cols = sorted({c for _, c in p.cells})
+    span = f"column {cols[0]}" if len(cols) == 1 else f"columns {cols[0]}-{cols[-1]}"
+    if f.lines:
+        clear = f"{CLEAR_NAMES[f.lines]} (+{nes_points(f.lines, status.level)} points)"
+        burned = f.ready_rows_before - f.ready_rows
+        if f.lines < 4 and burned > 0:
+            clear += f", burns {burned} Tetris-ready rows"
+    else:
+        clear = "no clear"
+    if f.well_height == 0:
+        well = "well open"
+    elif f.well_height_before == 0:
+        well = "BLOCKS the well"
+    else:
+        well = f"well still blocked ({f.well_height} high)"
+    return (
+        f"{span}: {clear}; {f.new_holes} new hole(s); {well}; "
+        f"{f.ready_rows} Tetris-ready row(s); spread {f.spread}; "
+        f"stack height {f.max_height}"
+    )
+
+
+def strategy_filter(board: Board, cands: list[Placement]) -> list[Placement]:
+    """Apply the strategy's hard rules; a rule that would empty the set is skipped.
+
+    Stack in danger (above DANGER_HEIGHT): keep the moves that leave the lowest
+    stack, then the fewest new holes. Otherwise: fewest new holes, never block
+    an open well, and an I goes into the well only for a Tetris.
+    """
+
+    def keep(
+        rule: Callable[[Placement], bool], pool: list[Placement]
+    ) -> list[Placement]:
+        return [p for p in pool if rule(p)] or pool
+
+    if max(column_heights(board)) > DANGER_HEIGHT:
+        lowest = min(p.features.max_height for p in cands)
+        kept = [p for p in cands if p.features.max_height == lowest]
+        fewest = min(p.features.new_holes for p in kept)
+        return [p for p in kept if p.features.new_holes == fewest]
+    fewest = min(p.features.new_holes for p in cands)
+    kept = [p for p in cands if p.features.new_holes == fewest]
+    kept = keep(
+        lambda p: not (p.features.well_height_before == 0 and p.features.well_height),
+        kept,
+    )
+    return keep(
+        lambda p: p.features.lines == 4 or WELL not in {c for _, c in p.cells},
+        kept,
+    )
+
+
+# --------------------------------------------------------------------------
+# Real time
+# --------------------------------------------------------------------------
+
+FPS = 60.0988  # NES NTSC frame rate
+# NES gravity in frames per row for levels 0-28; level 29 and up is 1.
+GRAVITY = [48, 43, 38, 33, 28, 23, 18, 13, 8, 6, 5, 5, 5, 4, 4, 4, 3, 3, 3]
+GRAVITY += [2] * 10
+DAS_DELAY, DAS_REPEAT = 16, 6  # NES delayed auto shift, in frames
+
+
+def frames_per_row(level: int) -> int:
+    return GRAVITY[level] if level < len(GRAVITY) else 1
+
+
+def spawn_left(piece: str) -> int:
+    return 4 if piece == "O" else 3
+
+
+def spawn_fits(board: Board, piece: str) -> bool:
+    return fits(board, ROTATIONS[piece][0], 0, spawn_left(piece))
+
+
+def realtime_landing(
+    board: Board, target: Placement, latency_s: float, level: int
+) -> tuple[Placement, dict[str, Any]]:
+    """Where the piece really lands if the decision arrives after latency_s.
+
+    The piece spawns in rotation 0 and falls at the level's NES gravity while
+    the agent thinks. When the decision arrives it rotates once, shifts one
+    column at a time on the NES auto-shift schedule while still falling, and
+    hard-drops when it reaches the target column. A blocked rotation or shift,
+    or landing first, locks the piece wherever it falls.
+    """
+    fpr = frames_per_row(level)
+    piece = target.piece
+    shape = ROTATIONS[piece][0]
+    top, left = 0, spawn_left(piece)
+    start = math.ceil(latency_s * FPS)
+    step = 1 if target.left > left else -1
+    shifts = abs(target.left - left)
+    shift_at = {
+        start + (0 if k == 0 else DAS_DELAY + DAS_REPEAT * (k - 1))
+        for k in range(shifts)
+    }
+    done_at = max(shift_at, default=start)
+    outcome = "on time"
+    fallen = 0
+    planning = True
+    frame = 0
+    while True:
+        if frame == start:
+            fallen = top
+            if target.rotation:
+                rotated = ROTATIONS[piece][target.rotation]
+                if fits(board, rotated, top, left):
+                    shape = rotated
+                else:
+                    planning, outcome = False, "rotation blocked"
+        if planning and frame >= start and frame in shift_at:
+            if fits(board, shape, top, left + step):
+                left += step
+            else:
+                planning, outcome = False, "shift blocked"
+        if planning and frame >= done_at:
+            while fits(board, shape, top + 1, left):
+                top += 1
+            break
+        if frame > 0 and frame % fpr == 0:
+            if fits(board, shape, top + 1, left):
+                top += 1
+            else:
+                if planning:
+                    outcome = (
+                        "landed before the decision"
+                        if frame < start
+                        else "landed before reaching the target"
+                    )
+                    fallen = top if frame < start else fallen
+                break
+        frame += 1
+    info = {
+        "latency_ms": round(1000 * latency_s, 1),
+        "frames_per_row": fpr,
+        "rows_fallen_at_decision": fallen,
+        "outcome": outcome,
+    }
+    cells = tuple(sorted((top + r, left + c) for r, c in shape))
+    if cells == tuple(sorted(target.cells)):
+        return target, info
+    after, lines = drop(board, piece, cells)
+    landed = Placement(
+        key="missed",
+        piece=piece,
+        rotation=-1,
+        left=left,
+        cells=cells,
+        board=after,
+        features=features_of(board, after, lines),
+    )
+    return landed, info
+
+
 # --------------------------------------------------------------------------
 # Agents
 # --------------------------------------------------------------------------
@@ -224,6 +433,10 @@ RULES = (
 )
 
 
+class BudgetError(RuntimeError):
+    """The compiled request does not fit the model's context."""
+
+
 class Unridden:
     def __init__(self, base: str, timeout: float = 60.0) -> None:
         self.base = base.rstrip("/")
@@ -232,6 +445,7 @@ class Unridden:
         self.tokens = 0
         self.seconds = 0.0
         self.exchanges: list[dict[str, Any]] = []  # raw HTTP log for the trace
+        self.pending: list[str] = []  # snapshot ids awaiting deletion
 
     def _req(self, method: str, path: str, body: Any = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
@@ -263,7 +477,10 @@ class Unridden:
                 if err.code == 429 and attempt < 19:
                     time.sleep(0.25)
                     continue
-                raise RuntimeError(f"{method} {path} -> {err.code}: {detail}") from None
+                message = f"{method} {path} -> {err.code}: {detail}"
+                if err.code == 422 and '"budget_error"' in detail:
+                    raise BudgetError(message) from None
+                raise RuntimeError(message) from None
         raise RuntimeError("unreachable")
 
     def decide(self, state: str, questions: dict[str, Any]) -> dict[str, Any]:
@@ -279,27 +496,32 @@ class Unridden:
             },
         )
         snap_id = snap["snapshots"][0]["id"]
+        # Deleted by flush() once the move is made, so cleanup is off the clock.
+        self.pending.append(snap_id)
         answers: dict[str, Any] = {}
-        try:
-            items = list(questions.items())
-            for i in range(0, len(items), 32):
-                resp = self._req(
-                    "POST",
-                    "/v2/decisions",
-                    {
-                        "snapshot": {"id": snap_id, "relationship": "followup"},
-                        "questions": dict(items[i : i + 32]),
-                        "readout": {"completed_blocks": 30},
-                    },
-                )
-                answers.update(resp["answers"])
-                self.tokens += resp["usage"]["input_tokens"]
-                self.calls += 1
-        finally:
-            with suppress(RuntimeError):
-                self._req("DELETE", f"/v2/snapshots/{snap_id}")
+        items = list(questions.items())
+        for i in range(0, len(items), 32):
+            resp = self._req(
+                "POST",
+                "/v2/decisions",
+                {
+                    "snapshot": {"id": snap_id, "relationship": "followup"},
+                    "questions": dict(items[i : i + 32]),
+                    "readout": {"completed_blocks": 30},
+                },
+            )
+            answers.update(resp["answers"])
+            self.tokens += resp["usage"]["input_tokens"]
+            self.calls += 1
         self.seconds += time.monotonic() - start
         return answers
+
+    def flush(self) -> None:
+        """Delete the snapshots made for the last move."""
+        for snap_id in self.pending:
+            with suppress(RuntimeError):
+                self._req("DELETE", f"/v2/snapshots/{snap_id}")
+        self.pending.clear()
 
 
 def state_text(board: Board, piece: str) -> str:
@@ -307,30 +529,106 @@ def state_text(board: Board, piece: str) -> str:
     return f"{RULES}\n\nCurrent board:\n{board_text}\n\nPiece to place: {piece}"
 
 
+STRATEGY = """GOAL: finish with the highest possible score, not just survive.
+
+SCORING (NES): single 40, double 100, triple 300, Tetris (4 lines at once) 1200,
+each multiplied by (level + 1). The level rises every 10 lines. One Tetris is
+worth 30 singles, so a clear of fewer than 4 lines wastes rows that could have
+become part of a Tetris.
+
+STRATEGY used by high-scoring players:
+1. Keep column 9 (the rightmost) empty as the well. Only an I piece goes in the
+   well, and only when it clears a Tetris.
+2. Stack columns 0-8 flat with no holes: keep the spread between their highest
+   and lowest column at 2 or less and never cover an empty cell.
+3. Build up to 4 or more Tetris-ready rows, then drop an I into the well.
+4. Burn (take a single, double or triple) only when the stack is dangerously
+   high (above 12 of 20 rows), when the well is blocked and must be dug out,
+   or when the clear removes holes. Survival beats score.
+5. Use the next piece: if it is an I and rows are Tetris-ready, keep the well
+   open for it. After a long wait for an I, keep the stack low."""
+
+
+def strategy_state(board: Board, piece: str, status: Status) -> str:
+    return (
+        f"{RULES}\n\n{STRATEGY}\n\n"
+        f"Score {status.score}, level {status.level}, lines {status.lines}. "
+        f"Pieces since the last I: {status.since_i}.\n\n"
+        f"Current board:\n{render_board(board)}\n\n"
+        f"Piece to place: {piece}. Next piece: {status.next_piece}."
+    )
+
+
 def choose_choice(
     client: Unridden, board: Board, piece: str, cands: list[Placement]
 ) -> tuple[Placement, str, dict[str, Any]]:
-    state = state_text(board, piece)
-    by_key = {p.key: p for p in cands}
     instructions = (
         f"Pick where to drop the {piece} piece. Prefer placements that clear "
         "lines, create no new holes, and keep the stack low and flat."
     )
+    return knockout(client, state_text(board, piece), instructions, cands, describe)
+
+
+def choose_strategy(
+    client: Unridden,
+    board: Board,
+    piece: str,
+    cands: list[Placement],
+    status: Status,
+    rules: bool = False,
+) -> tuple[Placement, str, dict[str, Any]]:
+    instructions = (
+        f"Pick where to drop the {piece} piece to maximize the final score, "
+        "following the strategy in the state."
+    )
+    kept = strategy_filter(board, cands) if rules else cands
+    if len(kept) == 1:
+        return kept[0], "rules left one", {"kept": [kept[0].key]}
+    pick, note, detail = knockout(
+        client,
+        strategy_state(board, piece, status),
+        instructions,
+        kept,
+        lambda p: describe_strategic(p, status),
+    )
+    detail["kept"] = [p.key for p in kept]
+    return pick, f"{len(kept)}/{len(cands)} kept, {note}", detail
+
+
+def knockout(
+    client: Unridden,
+    state: str,
+    instructions: str,
+    cands: list[Placement],
+    describe_fn: Callable[[Placement], str],
+) -> tuple[Placement, str, dict[str, Any]]:
+    """Choice over the placements in balanced groups, then a final of winners.
+
+    Groups hold at most 26 options (the label alphabet). A group that does not
+    fit the model's context is split further and the move is asked again.
+    """
+    by_key = {p.key: p for p in cands}
 
     def question(group: list[Placement]) -> dict[str, Any]:
         return {
             "type": "choice",
             "instructions": instructions,
-            "criteria": {p.key: describe(p) for p in group},
+            "criteria": {p.key: describe_fn(p) for p in group},
         }
 
-    groups = [cands[i : i + 26] for i in range(0, len(cands), 26)]
-    if len(groups) > 1:  # knockout: balance groups, then a final
-        half = (len(cands) + 1) // 2
-        groups = [cands[:half], cands[half:]]
-    answers = client.decide(state, {f"g{i}": question(g) for i, g in enumerate(groups)})
-    winners = [by_key[answers[f"g{i}"]["choice"]] for i in range(len(groups))]
-    conf = [answers[f"g{i}"]["confidence"] for i in range(len(groups))]
+    size = 26
+    while True:
+        count = -(-len(cands) // size)
+        groups = [cands[i::count] for i in range(count)] if count > 1 else [cands]
+        try:
+            answers = client.decide(
+                state, {f"g{i}": question(g) for i, g in enumerate(groups)}
+            )
+            break
+        except BudgetError:
+            if size <= 4:
+                raise
+            size //= 2
     rounds = [
         {
             "name": f"g{i}",
@@ -340,8 +638,10 @@ def choose_choice(
         }
         for i, g in enumerate(groups)
     ]
+    winners = [by_key[r["choice"]] for r in rounds]
     if len(winners) == 1:
-        return winners[0], f"conf {conf[0]:.3f}", {"rounds": rounds}
+        conf = answers["g0"]["confidence"]
+        return winners[0], f"conf {conf:.3f}", {"rounds": rounds}
     final = client.decide(state, {"final": question(winners)})["final"]
     rounds.append(
         {
@@ -353,7 +653,7 @@ def choose_choice(
     )
     return (
         by_key[final["choice"]],
-        f"knockout, conf {final['confidence']:.3f}",
+        f"knockout {len(groups)}, conf {final['confidence']:.3f}",
         {"rounds": rounds},
     )
 
@@ -427,15 +727,21 @@ def choose(
     board: Board,
     piece: str,
     cands: list[Placement],
+    status: Status,
 ) -> tuple[Placement, str, dict[str, Any]]:
     if len(cands) == 1:  # forced; a Choice needs at least two options
         return cands[0], "forced", {}
     if args.agent == "random":
         return rng.choice(cands), "", {}
+    if args.agent == "rules":  # the strategy's hard rules, then a coin flip
+        kept = strategy_filter(board, cands)
+        return rng.choice(kept), f"{len(kept)}/{len(cands)} kept", {}
     if args.agent == "heuristic" or client is None:
         return max(cands, key=heuristic_value), "", {}
     if args.agent == "choice":
         return choose_choice(client, board, piece, cands)
+    if args.agent == "strategy":
+        return choose_strategy(client, board, piece, cands, status, args.rules)
     return choose_score(client, board, piece, cands, args.hints)
 
 
@@ -449,9 +755,21 @@ def move_record(
     lines_total: int,
     ms: float,
     exchanges: list[dict[str, Any]],
+    status: Status,
+    score_total: int,
+    landed: Placement,
+    timing: dict[str, Any] | None,
 ) -> dict[str, Any]:
     pick, note, detail = choice
     return {
+        "landed": landed.key,
+        "landed_cells": landed.cells,
+        "landed_features": asdict(landed.features),
+        "realtime": timing,
+        "next_piece": status.next_piece,
+        "level": status.level,
+        "points": score_total - status.score,
+        "score_total": score_total,
         "type": "move",
         "move": number,
         "piece": piece,
@@ -472,9 +790,9 @@ def move_record(
         "heuristic_pick": best.key,
         "note": note,
         "detail": detail,
-        "lines_cleared": pick.features.lines,
+        "lines_cleared": landed.features.lines,
         "lines_total": lines_total,
-        "board_after": ["".join(r) for r in pick.board],
+        "board_after": ["".join(r) for r in landed.board],
         "ms": round(ms, 1),
         "exchanges": exchanges,
     }
@@ -508,15 +826,17 @@ def show(
 
 
 def play(args: argparse.Namespace) -> dict[str, Any]:
-    client = Unridden(args.url) if args.agent in ("choice", "score") else None
+    model_agents = ("choice", "strategy", "score")
+    client = Unridden(args.url) if args.agent in model_agents else None
     return run_game(args, client)
 
 
 def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any]:
     rng = random.Random(args.seed + 1)
     pieces = bag_stream(args.seed)
+    upcoming = next(pieces)
     board = empty_board()
-    lines = placed = agree = 0
+    lines = placed = agree = score = tetrises = since_i = missed = 0
     t0 = time.monotonic()
     agent = args.agent + ("+hints" if args.agent == "score" and args.hints else "")
     with ExitStack() as stack:
@@ -535,22 +855,36 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                 "height": HEIGHT,
                 "url": args.url if client else None,
                 "rules": RULES,
+                "realtime": args.realtime,
+                "start_level": args.start_level,
                 "started": time.time(),
             }
             trace.write(json.dumps(header) + "\n")
         while placed < args.max_pieces:
-            piece = next(pieces)
+            piece, upcoming = upcoming, next(pieces)
+            level = max(args.start_level, lines // 10)
+            status = Status(score, level, lines, upcoming, since_i)
             cands = placements(board, piece)
-            if not cands:
+            if not cands or (args.realtime and not spawn_fits(board, piece)):
                 break
             if client:
                 client.exchanges.clear()
             move_t0 = time.monotonic()
-            choice = choose(args, client, rng, board, piece, cands)
+            choice = choose(args, client, rng, board, piece, cands, status)
+            latency = time.monotonic() - move_t0
+            if client:
+                client.flush()
             pick, note, _ = choice
+            landed, timing = pick, None
+            if args.realtime:
+                landed, timing = realtime_landing(board, pick, latency, level)
+                missed += landed is not pick
             best = max(cands, key=heuristic_value)
             agree += pick is best
-            lines += pick.features.lines
+            score += nes_points(landed.features.lines, level)
+            tetrises += landed.features.lines == 4
+            since_i = 0 if piece == "I" else since_i + 1
+            lines += landed.features.lines
             placed += 1
             if trace:
                 record = move_record(
@@ -561,19 +895,30 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                     choice,
                     best,
                     lines,
-                    1000 * (time.monotonic() - move_t0),
+                    1000 * latency,
                     list(client.exchanges) if client else [],
+                    status,
+                    score,
+                    landed,
+                    timing,
                 )
                 trace.write(json.dumps(record) + "\n")
                 trace.flush()
-            board = pick.board
-            show(args, placed, piece, pick, len(cands), note, lines)
+            board = landed.board
+            if landed is not pick:
+                note = f"MISSED {pick.key}: {timing and timing['outcome']}"
+            show(args, placed, piece, landed, len(cands), note, lines)
         result: dict[str, Any] = {
             "agent": agent,
             "seed": args.seed,
             "pieces": placed,
             "lines": lines,
+            "score": score,
+            "tetrises": tetrises,
             "topped_out": placed < args.max_pieces,
+            "realtime": args.realtime,
+            "start_level": args.start_level,
+            "missed_moves": missed,
             "heuristic_agreement": round(agree / max(1, placed), 3),
             "wall_s": round(time.monotonic() - t0, 1),
         }
@@ -593,7 +938,9 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
-        "--agent", choices=["choice", "score", "heuristic", "random"], default="choice"
+        "--agent",
+        choices=["choice", "strategy", "score", "heuristic", "rules", "random"],
+        default="choice",
     )
     ap.add_argument("--url", default="http://127.0.0.1:8091", help="/v2 service")
     ap.add_argument("--seed", type=int, default=0)
@@ -602,6 +949,19 @@ def main() -> None:
         "--hints",
         action="store_true",
         help="score agent: append outcome stats to each drawn board",
+    )
+    ap.add_argument(
+        "--rules",
+        action="store_true",
+        help="strategy agent: apply the strategy's hard rules before asking",
+    )
+    ap.add_argument(
+        "--realtime",
+        action="store_true",
+        help="the piece falls at NES gravity while the agent decides",
+    )
+    ap.add_argument(
+        "--start-level", type=int, default=0, help="NES level (gravity, scoring)"
     )
     ap.add_argument("--watch", action="store_true", help="redraw the board each move")
     ap.add_argument("--delay", type=float, default=0.0, help="seconds between moves")
