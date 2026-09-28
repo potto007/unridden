@@ -1,5 +1,15 @@
 # Tetris: Gemma 4 26B-A4B vs E4B
 
+**Historical real-time results need rerunning.** On 2026-09-27 the controller
+audit found that `--pipeline` could use the confirmed board before the previous
+lock and, for lookahead/strategy, use a piece before it entered the one-piece
+preview. All real-time columns below used that scheduler. Their scores,
+survival and on-time rates do not establish rule-correct real-time play.
+Turn-based rows are unaffected by this timing bug; request timings remain
+historical workload measurements. The [correction report](tetris-information-correction.md)
+documents the fixed boundary and a limited 26B gateway rerun, not a rerun of
+this complete model/route matrix.
+
 Run on 2026-09-27, one RTX 5090, Gemma 4 26B-A4B and E4B instruction-tuned,
 both UD-Q4_K_XL from `unsloth/gemma-4-*-GGUF`, on llama.cpp release `v0.4.1`,
 commit `b29c606e28a01b1bc8c1351026a0fa6e616bf6c4`, with the layer-range patch.
@@ -95,7 +105,7 @@ includes the bge-m3 embedding server (about 1 GiB) and the Windows desktop:
 
 The difference between the two 26B-A4B v2 readings was not investigated.
 
-## Real time
+## Historical real time (invalid information schedule)
 
 Share of moves that landed where the agent chose ("on time"):
 
@@ -117,7 +127,7 @@ piece spawned in nearly every move, because pipelining starts each decision on
 the previewed piece. The heuristic, which decides in no time, misses as often
 as the models.
 
-## Findings
+## Historical findings (real-time conclusions require rerun)
 
 - **The controller decides the real-time games, not the model.** Holding the
   direction at level 29 cannot reach the outer columns before a piece lands
@@ -173,6 +183,9 @@ uv run python scripts/unridden/play_tetris.py --agent choice --seed 0 \
 
 Add `--lookahead` for the lookahead agent, drop the four real-time flags and
 `--start-level` for turn-based, use `--movement das` for hold, and
-`--agent heuristic` (no server) for the reference. The E4B v2 server is
-`serve --gpu --snapshots --no-v1` with the E4B model path, which selects the
-`full-v1` profile.
+`--agent heuristic` (no server) for the reference. The E4B v2 server needs
+the E4B model path and explicit
+`--snapshot-profile full-v1`, in addition to `serve --gpu --snapshots --no-v1`.
+Use a compatible source-built snapshot worker and its own manifest advertising
+`full-v1`; the v0.4.0 snapshot bundle predates this profile. The model path
+alone does not select the profile: the API default is still `split18-30-v1`.

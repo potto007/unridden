@@ -1,0 +1,20 @@
+[Unit]
+Description=Unridden application gateway (local context and typed decision API)
+Requires=localai-unridden-snapshots.service
+After=localai-unridden-snapshots.service
+PartOf=localai-unridden-snapshots.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/ottomation/unridden
+ExecStart=%h/src/ottomation/unridden/.venv/bin/python -m unridden.harness --backend-url http://127.0.0.1:8091 --port 8092 --snapshot-policy auto
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -196,6 +196,11 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8090)
     serve.add_argument(
+        "--uds",
+        type=str,
+        help="bind a Unix socket instead of host/port; parent directory must exist",
+    )
+    serve.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error"],
         default="info",
@@ -213,7 +218,7 @@ def main() -> None:
     config = _config(args)
     if args.command == "serve":
         configure_logging(args.log_level)
-        uvicorn.run(create_app(config), host=args.host, port=args.port)
+        uvicorn.run(create_app(config), host=args.host, port=args.port, uds=args.uds)
         return
     if args.output.exists():
         # Fail before the model load; open("x") below stays the real guard.
