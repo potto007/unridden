@@ -72,6 +72,15 @@ evaluations, Rider and disk persistence:
 
 ## Tetris through snapshots
 
+**Historical gameplay caveat:** the pipelined real-time rows below used an
+invalid information schedule. The controller could see the confirmed board
+before the preceding lock, and lookahead could read the following piece before
+it entered the one-piece preview. Their score/survival conclusions need rerun
+with the [corrected scheduler](tetris-information-correction.md). Turn-based
+rows and the native snapshot qualification above are unaffected by this bug.
+The request durations are historical measurements, not corrected gameplay or
+gateway timings; the corrected E4B/E2B comparison has not been run.
+
 The comparison game set from the Tetris demo (pruned, compact, static-state,
 dense board; real-time rows at 30 Hz tapping), through `/v2` snapshots and
 over `/v1` on the same model. The client reads the readout block from

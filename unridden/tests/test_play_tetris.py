@@ -36,7 +36,7 @@ class FakeUnridden(Unridden):
     """Answers every Choice with its last option and scores by question order."""
 
     def __init__(self, readout_block: int = 30) -> None:
-        super().__init__("http://fake")
+        super().__init__("http://fake", api="v2")
         self.decision_bodies: list[dict[str, Any]] = []
         self.snapshot_bodies: list[dict[str, Any]] = []
         self.deleted: list[str] = []

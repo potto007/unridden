@@ -78,6 +78,7 @@ canvas#spark { width: 100%; height: 64px; display: block; cursor: pointer; }
 .cand:hover, .cand.hover { background: var(--grid); }
 .cand.picked { background: var(--accent-soft); }
 .cand .key { font-weight: 600; }
+#rounds.plans .cand, #rounds.plans .axis { grid-template-columns: 13ch minmax(0, 1fr) minmax(90px, 32%) 8ch; }
 .cand .bar { position: relative; height: 16px; min-width: 0; }
 .cand .bar i { position: absolute; left: 0; top: 3px; bottom: 3px; background: var(--muted); opacity: .45; border-radius: 2px; }
 .cand.picked .bar i { background: var(--accent); opacity: 1; }
@@ -226,7 +227,9 @@ function renderStats(label) {
     `agent <b>${agentName}</b>`, `seed <b>${game.seed ?? "?"}</b>`,
     `pieces <b>${n}</b>`, `lines <b>${lines}</b>`, status,
     `matches heuristic <b>${(agree * 100).toFixed(1)}%</b>`,
-    `model time <b>${ms.toFixed(0)} ms</b>/move`,
+    `decision work <b>${ms.toFixed(0)} ms</b>/move`,
+    game.realtime ? "simulated gravity" : "turn-based",
+    game.realtime && !game.information_rules ? "legacy trace: preview and board timing not verified" : "",
     result && result.input_tokens ? `prefill <b>${(result.input_tokens / 1000).toFixed(0)}k</b> tokens, <b>0</b> generated` : "",
   ].filter(Boolean).map(s => `<span>${s}</span>`).join("");
 }
@@ -264,16 +267,16 @@ function drawBoard() {
   if (anim < 1) {
     // falling phase: before-board plus the picked piece dropping into place
     m.board_before.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch)); }));
-    const pick = m.candidates.find(c => c.key === m.pick);
-    const minR = Math.min(...pick.cells.map(c => c[0]));
+    const landedCells = m.landed_cells || m.candidates.find(c => c.key === m.pick).cells;
+    const minR = Math.min(...landedCells.map(c => c[0]));
     const t = Math.min(1, anim / 0.75), ease = t * t;
     const off = (1 - ease) * minR;
-    pick.cells.forEach(([r, c]) => cell(bctx, c, r - off, s, pc));
+    landedCells.forEach(([r, c]) => cell(bctx, c, r - off, s, pc));
   } else {
     m.board_after.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch)); }));
   }
   if (hoverKey) {
-    const hc = m.candidates.find(c => c.key === hoverKey);
+    const hc = [...m.candidates, ...(m.detail?.plan_options || [])].find(c => c.key === hoverKey);
     if (hc) {
       bctx.fillStyle = "rgba(0,0,0,0.35)"; bctx.fillRect(0, 0, w, h);
       m.board_before.forEach((row, y) => [...row].forEach((ch, x) => { if (ch !== ".") cell(bctx, x, y, s, css("--" + ch), 0.55); }));
@@ -294,32 +297,41 @@ function tick(now) {
 const fmtP = p => p >= 0.001 ? p.toFixed(4) : p.toExponential(1);
 function candRow(m, c, value, width, text) {
   const tags = (c.key === m.heuristic_pick ? `<span class="tag h">H</span>` : "");
-  return `<div class="cand${c.key === m.pick ? " picked" : ""}" data-key="${c.key}">
+  return `<div class="cand${c.key === (m.detail?.plan || m.pick) ? " picked" : ""}" data-key="${c.key}">
     <span class="key">${c.key}${tags}</span>
     <span class="desc" title="${text}">${text}</span><span class="bar"><i style="width:${(width * 100).toFixed(2)}%"></i></span>
     <span class="val">${value}</span></div>`;
 }
 
 function renderDecision(m) {
-  const byKey = Object.fromEntries(m.candidates.map(c => [c.key, c]));
+  const byKey = Object.fromEntries([...m.candidates, ...(m.detail?.plan_options || [])].map(c => [c.key, c]));
   const d = m.detail || {};
+  $("rounds").classList.toggle("plans", Boolean(d.plan));
   let html = "";
   const short = c => c.description.replace(/^rotation \d+, /, "");
   if (d.rounds) {
-    $("decisionTitle").textContent = "Choice readout, log10 P over the offered placements";
+    if (d.rounds.some(r => r.options.some(k => !byKey[k]))) {
+      $("decisionTitle").textContent = "Choice readout";
+      $("rounds").innerHTML = '<p class="note">This legacy trace lacks descriptions for its plan options. The original request and answer remain available below.</p>';
+      $("decisionNote").textContent = "";
+      return;
+    }
+    $("decisionTitle").textContent = `Choice readout, log10 P over the offered ${d.plan ? "plans" : "placements"}`;
     const LO = -12;
     d.rounds.forEach(r => {
       const rows = r.options.map(k => ({ c: byKey[k], p: r.probabilities[k] })).sort((a, b) => b.p - a.p);
-      const title = r.name === "final" ? "Final" : d.rounds.length > 1 ? `Group ${r.name.slice(1) * 1 + 1}` : "All placements";
+      const title = r.name === "final" ? "Final" : d.rounds.length > 1 ? `Group ${r.name.slice(1) * 1 + 1}` : `Offered ${d.plan ? "plans" : "placements"}`;
       const top = rows.slice(0, 8), rest = rows.slice(8);
       const row = x => candRow(m, x.c, fmtP(x.p), Math.max(0, (Math.log10(Math.max(x.p, 1e-300)) - LO) / -LO), short(x.c));
       html += `<div class="round"><h3>${title} <span>${rows.length} options, picked ${r.choice}</span></h3>
         <div class="axis"><span></span><span></span><div><span>1e${LO}</span><span>1e-6</span><span>1</span></div><span></span></div>
         <div class="cands">${top.map(row).join("")}${rest.length ? `<div hidden>${rest.map(row).join("")}</div><button class="more">show ${rest.length} more</button>` : ""}</div></div>`;
     });
-    $("decisionNote").textContent = m.candidates.length > 26
-      ? `${m.candidates.length} placements exceed the 26-label alphabet, so they ran as two independent Choice questions and the two winners met in a final. H marks the fixed heuristic's pick.`
-      : "One Choice question over every distinct placement. H marks the fixed heuristic's pick.";
+    $("decisionNote").textContent = d.plan
+      ? "The controller enumerated two-piece plans. The model selected a plan; only its first placement is attempted. Hover previews that first placement."
+      : d.rounds.length > 1
+      ? `The controller used ${d.rounds.length} Choice questions to compare its offered placements. Grouping and final selection are controller policy. H marks the fixed heuristic's pick.`
+      : `One Choice question over ${d.rounds[0].options.length} offered placements, from ${m.candidates.length} legal candidates. H marks the fixed heuristic's pick.`;
   } else if (d.scores) {
     $("decisionTitle").textContent = "Score readout, expected level per placement (0 terrible to 4 excellent)";
     const rows = m.candidates.map(c => ({ c, s: d.scores[c.key] })).sort((a, b) => b.s - a.s);
@@ -333,7 +345,7 @@ function renderDecision(m) {
       : "Each question shows only the board with the candidate drawn as '@'; no computed stats. H marks the fixed heuristic's pick.";
   } else {
     $("decisionTitle").textContent = "Decision";
-    html = `<p class="note">${m.note === "forced" ? "Only one legal placement was left, so the model was not asked." : "This agent does not call the model."}</p>`;
+    html = `<p class="note">${m.note === "forced" ? "Only one legal placement was left, so the model was not asked." : "No model call was needed for this move."}</p>`;
     $("decisionNote").textContent = "";
   }
   $("rounds").innerHTML = html;
@@ -348,16 +360,22 @@ function renderExchanges(m) {
   $("exchanges").innerHTML = ex.map((e, i) => {
     const what = e.path === "/v2/snapshots" ? "prefill the board as a context snapshot"
       : e.path === "/v2/decisions" ? `${Object.keys(e.request.questions).length} question(s) branch from the snapshot`
+      : e.path === "/v1/decisions" && e.response?.context_usage
+        ? `gateway: ${e.response.context_usage.cache === "hit" ? "reuse stable context" : "capture stable context"}`
+      : e.path === "/v1/decisions" ? "ordinary native decision"
       : e.method === "DELETE" ? "drop the snapshot" : "";
     let body = "";
     if (e.request && e.request.input && typeof e.request.input.state === "string") {
       const { state, ...restInput } = e.request.input;
       body += `<h2 style="margin-top:4px">State text (shared prefix)</h2><pre class="prompt">${esc(state)}</pre><h2 style="margin-top:12px">Request</h2><pre>${esc(JSON.stringify({ ...e.request, input: { ...restInput, state: "(shown above)" } }, null, 2))}</pre>`;
+    } else if (e.request && typeof e.request.state === "string") {
+      const { state, ...rest } = e.request;
+      body += `<h2 style="margin-top:4px">State text (shared prefix)</h2><pre class="prompt">${esc(state)}</pre><h2 style="margin-top:12px">Request</h2><pre>${esc(JSON.stringify({ ...rest, state: "(shown above)" }, null, 2))}</pre>`;
     } else if (e.request) {
       body += `<h2 style="margin-top:4px">Request</h2><pre>${esc(JSON.stringify(e.request, null, 2))}</pre>`;
     }
     body += `<h2 style="margin-top:12px">Response ${e.status}</h2><pre>${esc(JSON.stringify(e.response, null, 2))}</pre>`;
-    return `<details class="ex"><summary><span class="m">${e.method}</span><span>${esc(e.path.replace(/snap_[0-9a-f]+/, "{id}"))}</span><span style="color:var(--muted)">${what}</span><span class="ms">${e.ms} ms</span></summary><div class="jsonbox">${body}</div></details>`;
+    return `<details class="ex"><summary><span class="m">${e.method}</span><span>${esc(e.path.replace(/snap_[0-9a-f]+/, "{id}"))}</span><span style="color:var(--muted)">${what}</span><span class="ms">${typeof e.ms === "number" ? `${e.ms} ms` : "not timed"}</span></summary><div class="jsonbox">${body}</div></details>`;
   }).join("");
 }
 
@@ -369,8 +387,8 @@ function drawSpark() {
   const n = moves.length; if (!n) return;
   const pad = 4 * dpr, X = i => pad + (w - 2 * pad) * (n === 1 ? 0 : i / (n - 1));
   const maxL = Math.max(1, moves[n - 1].lines_total), H = game.height || 20;
-  const heights = moves.map(m => { const c = m.candidates.find(c => c.key === m.pick); return c.features.max_height; });
-  const holes = moves.map(m => m.candidates.find(c => c.key === m.pick).features.holes);
+  const heights = moves.map(m => (m.landed_features || m.candidates.find(c => c.key === m.pick).features).max_height);
+  const holes = moves.map(m => (m.landed_features || m.candidates.find(c => c.key === m.pick).features).holes);
   sctx.strokeStyle = css("--grid"); sctx.lineWidth = dpr;
   [0.25, 0.5, 0.75].forEach(f => { sctx.beginPath(); sctx.moveTo(pad, h * f); sctx.lineTo(w - pad, h * f); sctx.stroke(); });
   const line = (vals, max, color, fill) => {
@@ -396,12 +414,14 @@ spark.addEventListener("click", e => {
 function show(i, animate = true) {
   if (!moves.length) return;
   idx = Math.max(0, Math.min(moves.length - 1, i));
-  const m = moves[idx], pick = m.candidates.find(c => c.key === m.pick), f = pick.features;
+  const m = moves[idx], pick = m.candidates.find(c => c.key === m.pick), f = m.landed_features || pick.features;
   $("scrub").value = idx;
   $("pos").textContent = `${idx + 1} / ${moves.length}`;
   $("moveline").innerHTML = `<span class="big">#${m.move} ${m.piece} &rarr; ${m.pick}</span>
     <span>${m.candidates.length} placements, ${m.ms} ms${m.pick === m.heuristic_pick ? ", same as heuristic" : `, heuristic wanted ${m.heuristic_pick}`}</span>
-    <span>lines ${m.lines_total}${m.lines_cleared ? ` (+${m.lines_cleared})` : ""} &middot; holes ${f.holes} &middot; height ${f.max_height}</span>`;
+    <span>lines ${m.lines_total}${m.lines_cleared ? ` (+${m.lines_cleared})` : ""} &middot; holes ${f.holes} &middot; height ${f.max_height}</span>
+    <span>${game.realtime && !game.information_rules ? "Legacy recorded preview (availability unverified)" : "Next preview at decision"}: ${m.next_piece == null ? "hidden until spawn" : esc(m.next_piece)}${m.realtime && game.information_rules ? ` &middot; ${m.realtime.head_start_ms > 0 ? "entry-delay head start" : "decision begins at/after spawn"}` : ""}</span>
+    ${m.landed === "missed" ? `<span>Target missed: ${esc(m.realtime?.outcome || "different landing")}. Board and animation show the actual landing.</span>` : ""}`;
   hoverKey = null;
   renderDecision(m);
   renderExchanges(m);

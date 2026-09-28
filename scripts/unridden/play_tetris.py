@@ -1,8 +1,8 @@
-"""Play Tetris with Unridden making every placement decision.
+"""Play Tetris with typed model decisions and explicit controller baselines.
 
 Each turn the engine enumerates every legal hard-drop placement (rotation x
-column) of the current piece, then asks Unridden to pick one. The board is
-prefilled once as a /v2 context snapshot and the questions branch from it.
+column) of the current piece, then asks Unridden to pick one. By default it
+sends state and questions to the gateway, which manages snapshot reuse.
 
 Agents:
   choice     one Choice question per group of <=26 placements; each option is
@@ -20,14 +20,16 @@ Agents:
 --realtime makes the piece fall at NES gravity (--start-level) while the agent
 decides; a late decision locks the piece wherever it has fallen.
 
-Stdlib only; talks HTTP to the /v2 snapshots service (`serve --snapshots`,
-:8091 by default). `--trace` writes every move and HTTP exchange as JSONL for
-tetris_replay.html. Results: docs/results/tetris-demo.md.
+Stdlib only; talks HTTP to the gateway (:8092 by default). Explicit --api v2
+and --api v1 retain native comparison paths; pass their service URL. --trace
+writes moves and HTTP exchanges as JSONL for tetris_replay.html. Historical
+native results: docs/results/tetris-demo.md.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import math
 import random
@@ -42,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 WIDTH, HEIGHT = 10, 20
+INFORMATION_RULES = "one-preview-confirmed-board-v1"
 
 # Rotation 0 of each tetromino as (row, col) cells; other rotations are derived.
 SHAPES: dict[str, list[tuple[int, int]]] = {
@@ -344,12 +347,12 @@ def describe(p: Placement) -> str:
 
 @dataclass(frozen=True)
 class Status:
-    """What a player sees beside the board: score, level and the preview."""
+    """Controller-visible state at decision start; an unseen preview is None."""
 
     score: int
     level: int
     lines: int
-    next_piece: str
+    next_piece: str | None
     since_i: int  # pieces placed since the last I
 
 
@@ -568,10 +571,14 @@ class BudgetError(RuntimeError):
 
 
 class Unridden:
-    def __init__(self, base: str, timeout: float = 60.0, api: str = "v2") -> None:
+    def __init__(self, base: str, timeout: float = 60.0, api: str = "gateway") -> None:
         self.base = base.rstrip("/")
         self.timeout = timeout
-        self.api = api  # v2: snapshots then decisions; v1: one /v1/decisions call
+        self.api = api
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookies)
+        )
         self.calls = 0
         self.tokens = 0
         self.seconds = 0.0
@@ -601,10 +608,11 @@ class Unridden:
             method=method,
             headers={"content-type": "application/json"},
         )
-        for attempt in range(20):
+        attempts = 1 if self.api == "gateway" else 20
+        for attempt in range(attempts):
             start = time.monotonic()
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with self.opener.open(req, timeout=self.timeout) as resp:
                     raw = resp.read()
                     out = json.loads(raw) if raw else None
                     self.exchanges.append(
@@ -620,11 +628,30 @@ class Unridden:
                     return out
             except urllib.error.HTTPError as err:
                 detail = err.read().decode(errors="replace")
-                if err.code == 429 and attempt < 19:
+                try:
+                    error_body = json.loads(detail)
+                except ValueError:
+                    error_body = None
+                self.exchanges.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "status": err.code,
+                        "ms": round(1000 * (time.monotonic() - start), 1),
+                        "request": body,
+                        "response": error_body,
+                    }
+                )
+                if err.code == 429 and attempt < attempts - 1:
                     time.sleep(0.25)
                     continue
                 message = f"{method} {path} -> {err.code}: {detail}"
-                if err.code == 422 and '"budget_error"' in detail:
+                if (
+                    err.code == 422
+                    and isinstance(error_body, dict)
+                    and isinstance(error_body.get("error"), dict)
+                    and error_body["error"].get("code") == "budget_error"
+                ):
                     raise BudgetError(message) from None
                 raise RuntimeError(message) from None
         raise RuntimeError("unreachable")
@@ -632,11 +659,21 @@ class Unridden:
     def decide(
         self, state: str, questions: dict[str, Any], keep: bool = False
     ) -> dict[str, Any]:
-        """Answer questions over state. keep reuses one snapshot of a fixed state."""
+        """Answer questions; gateway owns lifecycle, keep applies only to native v2."""
         # Off the clock: one lookup per game, not part of any move.
-        final = self.final_block() if self.api != "v1" else 0
+        final = self.final_block() if self.api == "v2" else 0
         start = time.monotonic()
-        if self.api == "v1":  # the whole prompt in one request; no snapshots
+        if self.api == "gateway":
+            # One application call; admission, native batching and snapshot
+            # lifecycle are the gateway's responsibility.
+            response = self._req(
+                "POST", "/v1/decisions", {"state": state, "questions": questions}
+            )
+            self.tokens += response["usage"]["input_tokens"]
+            self.calls += 1
+            self.seconds += time.monotonic() - start
+            return dict(response["answers"])
+        if self.api == "v1":
             answers_v1: dict[str, Any] = {}
             items_v1 = list(questions.items())
             for i in range(0, len(items_v1), 32):
@@ -695,6 +732,7 @@ class Unridden:
         self.pending.extend(self.kept.values())
         self.kept.clear()
         self.flush()
+        self.cookies.clear()
 
 
 def state_text(board: Board, piece: str, dense: bool = False) -> str:
@@ -723,6 +761,8 @@ STRATEGY used by high-scoring players:
 
 
 def strategy_state(board: Board, piece: str, status: Status) -> str:
+    if status.next_piece is None:
+        raise ValueError("The strategy agent needs a visible next-piece preview")
     return (
         f"{RULES}\n\n{STRATEGY}\n\n"
         f"Score {status.score}, level {status.level}, lines {status.lines}. "
@@ -975,12 +1015,26 @@ def choose_plan(
 
     Plans are always pruned to the non-dominated set; there are up to ~1,000.
     """
+    if status.next_piece is None:
+        raise ValueError("Two-move planning needs a visible next-piece preview")
     plans, parts = two_move_plans(board, piece, status.next_piece)
     if not plans:  # no first move leaves room for the next piece
         cands = placements(board, piece)
         return max(cands, key=heuristic_value), "no plan survives", {}
     kept = prune(plans)
-    detail: dict[str, Any] = {"plans": len(plans), "kept": [p.key for p in kept]}
+    detail: dict[str, Any] = {
+        "plans": len(plans),
+        "kept": [p.key for p in kept],
+        "plan_options": [
+            {
+                "key": p.key,
+                "first_move": parts[p.key][0].key,
+                "cells": parts[p.key][0].cells,
+                "description": describe_plan(p, parts),
+            }
+            for p in kept
+        ],
+    }
     if len(kept) == 1:
         plan = kept[0]
         return parts[plan.key][0], "plan pruned to one", detail | {"plan": plan.key}
@@ -1090,6 +1144,35 @@ def play(args: argparse.Namespace) -> dict[str, Any]:
     return run_game(args, client)
 
 
+def needs_next_preview(args: argparse.Namespace) -> bool:
+    """These policies use the piece *after* the piece being placed."""
+    return args.agent == "strategy" or (
+        args.lookahead and args.agent in ("choice", "pruned")
+    )
+
+
+def decision_start(
+    *,
+    spawn_at: float,
+    previewed_at: float,
+    board_ready_at: float,
+    agent_free_at: float,
+    pipeline: bool,
+    needs_preview: bool,
+) -> float:
+    """Start only once all inputs exist in the one-preview game.
+
+    The piece itself enters preview at the previous spawn. Its landing board
+    is confirmed at the previous lock (line clearing is deterministic then).
+    The following piece enters preview only at this piece's own spawn.
+    No speculative future board is supplied to the controller.
+    """
+    available = previewed_at if pipeline else spawn_at
+    if needs_preview:
+        available = max(available, spawn_at)
+    return max(available, board_ready_at, agent_free_at)
+
+
 def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any]:
     rng = random.Random(args.seed + 1)
     pieces = bag_stream(args.seed)
@@ -1098,11 +1181,13 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
     lines = placed = agree = score = tetrises = since_i = missed = 0
     # Simulated game clock in seconds (real-time mode). The agent may start on
     # a piece once the board it lands on is known and the agent is free.
-    spawn_at = agent_free_at = previewed_at = 0.0
+    spawn_at = agent_free_at = previewed_at = board_ready_at = 0.0
     last_pause = 0  # frames of entry delay before the current piece
     t0 = time.monotonic()
     agent = args.agent + ("+hints" if args.agent == "score" and args.hints else "")
     with ExitStack() as stack:
+        if client:
+            stack.callback(client.close)
         trace = None
         if args.trace:
             Path(args.trace).parent.mkdir(parents=True, exist_ok=True)
@@ -1117,34 +1202,49 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                 "width": WIDTH,
                 "height": HEIGHT,
                 "url": args.url if client else None,
+                "api": client.api if client else None,
                 "rules": RULES,
                 "realtime": args.realtime,
                 "start_level": args.start_level,
+                "information_rules": INFORMATION_RULES,
+                "preview_pieces": 1,
+                "pipeline": args.pipeline,
+                "lookahead": args.lookahead,
                 "started": time.time(),
             }
             trace.write(json.dumps(header) + "\n")
         while placed < args.max_pieces:
             piece, upcoming = upcoming, next(pieces)
             level = max(args.start_level, lines // 10)
-            status = Status(score, level, lines, upcoming, since_i)
+            start = decision_start(
+                spawn_at=spawn_at,
+                previewed_at=previewed_at,
+                board_ready_at=board_ready_at,
+                agent_free_at=agent_free_at,
+                pipeline=args.pipeline,
+                needs_preview=needs_next_preview(args),
+            )
+            # The simulator owns the stream; the controller only gets the
+            # observation available at its scheduled start. Even policies that
+            # currently ignore the preview must not receive a hidden piece.
+            preview_visible = not args.realtime or start >= spawn_at
+            status = Status(
+                score, level, lines, upcoming if preview_visible else None, since_i
+            )
+            move_t0 = time.monotonic()
             cands = placements(board, piece)
             if not cands or (args.realtime and not spawn_fits(board, piece)):
                 break
             if client:
                 client.exchanges.clear()
-            move_t0 = time.monotonic()
             choice = choose(args, client, rng, board, piece, cands, status)
             latency = time.monotonic() - move_t0
             if client:
                 client.flush()
+            occupied = time.monotonic() - move_t0
             pick, note, _ = choice
             landed, timing = pick, None
             if args.realtime:
-                # Pipelined, the agent starts once it is free and the piece is in
-                # the one-piece preview, which happens when the previous piece
-                # spawns. Otherwise it starts when the piece itself spawns.
-                visible = previewed_at if args.pipeline else spawn_at
-                start = max(visible, agent_free_at)
                 decided = start + latency
                 late_by = max(0.0, decided - spawn_at)
                 # The direction can be held during the entry delay, but only
@@ -1163,11 +1263,19 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
                     compute_ms=round(1000 * latency, 1),
                     head_start_ms=round(1000 * (spawn_at - start), 1),
                     spawn_s=round(spawn_at, 4),
+                    decision_start_s=round(start, 6),
+                    decision_ready_s=round(decided, 6),
+                    board_available_s=round(board_ready_at, 6),
+                    piece_available_s=round(previewed_at, 6),
+                    next_piece_available_s=round(spawn_at, 6),
+                    next_piece_visible=preview_visible,
+                    cleanup_ms=round(1000 * (occupied - latency), 1),
                 )
-                agent_free_at = decided
+                agent_free_at = start + occupied
                 previewed_at = spawn_at  # the next piece shows as this one spawns
                 last_pause = delay
-                spawn_at += (timing["lock_frame"] + delay) / FPS
+                board_ready_at = spawn_at + timing["lock_frame"] / FPS
+                spawn_at = board_ready_at + delay / FPS
             best = max(cands, key=heuristic_value)
             agree += pick.key == best.key
             score += nes_points(landed.features.lines, level)
@@ -1217,19 +1325,22 @@ def run_game(args: argparse.Namespace, client: Unridden | None) -> dict[str, Any
             "lookahead": args.lookahead,
             "tap_hz": args.tap_hz,
             "dense_board": args.dense_board,
+            "information_rules": INFORMATION_RULES,
             "heuristic_agreement": round(agree / max(1, placed), 3),
             "wall_s": round(time.monotonic() - t0, 1),
         }
         if client:
             result.update(
+                api=client.api,
                 requests=client.calls,
                 input_tokens=client.tokens,
+                decision_client_s=round(client.seconds, 3),
+                # Historical field retained for replay compatibility. This is
+                # client elapsed time, including HTTP/retries/capture, not GPU time.
                 model_s=round(client.seconds, 1),
             )
         if trace:
             trace.write(json.dumps({"type": "result", **result}) + "\n")
-    if client:
-        client.close()
     return result
 
 
@@ -1250,12 +1361,12 @@ def main() -> None:
         ],
         default="choice",
     )
-    ap.add_argument("--url", default="http://127.0.0.1:8091", help="service base URL")
+    ap.add_argument("--url", help="service base URL; defaults depend on --api")
     ap.add_argument(
         "--api",
-        choices=["v2", "v1"],
-        default="v2",
-        help="v2 snapshots service (:8091) or the plain v1 service",
+        choices=["gateway", "v2", "v1"],
+        default="gateway",
+        help="gateway (:8092), native snapshots (:8091), or ordinary v1 (:8090)",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-pieces", type=int, default=200)
@@ -1298,7 +1409,7 @@ def main() -> None:
     ap.add_argument(
         "--static-state",
         action="store_true",
-        help="choice agent: rules as a game-long snapshot, board in the question",
+        help="choice agent: stable rules as state, varying board in the question",
     )
     ap.add_argument(
         "--dense-board", action="store_true", help="board rows without spaces"
@@ -1311,7 +1422,10 @@ def main() -> None:
     ap.add_argument(
         "--pipeline",
         action="store_true",
-        help="real time: start on the next piece as soon as the last decision is in",
+        help=(
+            "real time: plan during entry delay once the board is confirmed; "
+            "lookahead/strategy wait for the following preview at spawn"
+        ),
     )
     ap.add_argument("--watch", action="store_true", help="redraw the board each move")
     ap.add_argument("--delay", type=float, default=0.0, help="seconds between moves")
@@ -1319,7 +1433,11 @@ def main() -> None:
     ap.add_argument(
         "--trace", help="write every move and HTTP exchange as JSONL for the replay"
     )
-    print(json.dumps(play(ap.parse_args())))
+    args = ap.parse_args()
+    if args.url is None:
+        port = {"gateway": 8092, "v2": 8091, "v1": 8090}[args.api]
+        args.url = f"http://127.0.0.1:{port}"
+    print(json.dumps(play(args)))
 
 
 if __name__ == "__main__":

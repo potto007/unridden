@@ -1,5 +1,14 @@
 # Tetris demo
 
+**Timing correction, 2026-09-27:** the historical `--pipeline` real-time
+results below used information too early: the confirmed landing board could
+arrive before the preceding lock, and lookahead/strategy could see the
+following piece before it entered the one-piece preview. Those gameplay,
+survival and on-time claims need rerunning. Turn-based decisions are unaffected
+by this clock bug. Recorded request durations remain measurements of the old
+workloads, not evidence of corrected real-time performance. See the
+[correction and limited rerun](tetris-information-correction.md).
+
 Run on 2026-09-26, one RTX 5090, Gemma 4 26B-A4B UD-Q4_K_XL, through the `/v2`
 snapshots service (`serve --snapshots`, profile `split18-30-v1`, readout at
 block 30) on llama.cpp release `v0.4.1`, commit
@@ -109,8 +118,10 @@ Four flags cut the decision time and use the game's own pauses:
   need no call.
 - `--compact` shortens the option text.
 - `--nes-delays` adds the NES entry delay and line-clear pause.
-- `--pipeline` starts on the previewed piece as soon as the agent is free,
-  capped by the one-piece preview.
+- `--pipeline` now starts after the preceding piece locks and the agent is
+  free, using the entry delay when possible. Policies using the following
+  preview (lookahead/strategy) wait until the current piece spawns. The tables
+  here used the older, premature start described in the correction above.
 
 Plain prompt, seeds 0 and 1, 300-piece cap:
 
@@ -261,11 +272,60 @@ flags as above. Pieces and score for seeds 0 / 1, then mean decision time:
 [tetris-26b-vs-e4b.md](tetris-26b-vs-e4b.md) repeats the 26B-A4B and E4B
 comparison on both routes, five seeds and five modes each.
 
-## Reproduce
+## Current gateway path
+
+The controller now defaults to the [application gateway](../context-harness.md).
+It sends the same state and questions through an automatic cookie scope. The
+gateway owns checkpoint discovery, capture, reuse, expiry, lost-parent
+recovery, native question batching and bounded busy handling. Static-state mode reuses the rules across moves; ordinary board-state
+mode captures when the board changes and reuses it across tournament rounds or
+question batches. That API migration preserved game policy. The subsequent
+[information-timing correction](tetris-information-correction.md) changes
+real-time scheduling independently of the gateway, on all three API routes.
+
+With the native snapshot backend and gateway already healthy:
+
+```bash
+uv run python scripts/unridden/play_tetris.py --agent choice --seed 0 \
+  --max-pieces 100 --compact --prune --static-state \
+  --trace outputs/tetris/gateway-seed0.jsonl
+```
+
+The default URL is the gateway on port 8092. `--api v2` retains the direct
+snapshot comparison (default port 8091); `--api v1` retains ordinary inference
+(default port 8090). `--url` overrides any default. These modes do not start a
+backend or load a model. The current snapshot-only service does not serve the
+ordinary path.
+
+The replay displays gateway hit/miss diagnostics as well as native exchanges.
+Trace headers and results record the selected API. `decision_client_s` measures
+elapsed client decision work, including HTTP, internal waiting and capture when paid;
+the historical `model_s` field remains an alias for compatibility, not a claim
+of GPU-only time. In corrected traces, `compute_ms` includes initial candidate
+enumeration and `choose()`, including plan construction and multiple requests.
+Historical traces timed only `choose()`. Neither is a single forward-pass timing.
+Automatic cleanup occurs behind the API and may contribute to a request;
+native cleanup is separately timed and now delays the next decision's start.
+This remains a simulated clock; replay rendering and trace-writing overhead
+are not modeled as controller latency.
+
+Six-move live checks on the running 26B service preserved exact answer JSON and
+selected moves against native snapshots for both static and changing states.
+The static game had one capture then a reuse; changing state captured twice.
+Only two of six moves needed model calls after pruning. This is a migration
+check, not a new gameplay or latency benchmark. Raw traces and the comparison
+are in `outputs/harness-check/tetris-*.jsonl` and
+`outputs/harness-check/tetris-gateway-parity.json`.
+
+The historical tables above used native paths and have not been relabeled as
+gateway results. See the [gateway guide](../gateway-deployment.md) for the
+current client-facing API.
+
+## Reproduce the historical native path
 
 ```bash
 uv run python -m unridden.api.cli serve --gpu --snapshots --no-v1 --port 8091 &
-uv run python scripts/unridden/play_tetris.py --agent choice --seed 0 \
+uv run python scripts/unridden/play_tetris.py --api v2 --agent choice --seed 0 \
   --max-pieces 500 --trace outputs/tetris/choice-seed0.jsonl
 uv run python scripts/unridden/play_tetris.py --agent heuristic --seed 0 --max-pieces 500
 ```
