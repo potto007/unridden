@@ -11,6 +11,8 @@ decisions had 46–49 ms median compute time across four games on an RTX 5090.
 That includes controller work and is not a general API latency claim. See the
 [measured results](#measured-results) for outcomes and limits.
 
+**Watch the Tetris demo:** [recorded simulator runs on YouTube](https://youtu.be/2_xU7iGI7xI). [Explore all twelve corrected games](https://potto007.github.io/unridden/).
+
 It is not a chat model, not a text generator, and not a drop-in replacement for
 a hosted service. It runs one llama.cpp child process on your own machine,
 answers one request at a time, and never samples or appends a token.
