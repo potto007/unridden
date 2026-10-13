@@ -189,6 +189,7 @@ class SnapshotNativeBackend:
         threads: int = 8,
         reference: bool = False,
         snapshot_profile: ProfileName = SNAPSHOT_PROFILE,
+        tuned_lens_path: Path | None = None,
         max_response_bytes: int = WORKER_PROTOCOL_BYTES,
         default_timeout: float = 120.0,
         startup_timeout: float = 600.0,
@@ -204,6 +205,9 @@ class SnapshotNativeBackend:
         self.threads = threads
         self.reference_context = reference
         self.snapshot_profile = snapshot_profile
+        self.tuned_lens_path = (
+            tuned_lens_path.resolve() if tuned_lens_path is not None else None
+        )
         self.max_response_bytes = max_response_bytes
         self.default_timeout = default_timeout
         self.startup_timeout = startup_timeout
@@ -237,6 +241,21 @@ class SnapshotNativeBackend:
         ):
             if not path.is_file():
                 raise ValueError(f"{name} file is missing")
+        model_sha256 = digest(self.model_path)
+        expected = self.expected_model_sha256
+        if expected is not None and model_sha256 != expected:
+            raise ValueError("model hash differs from the configured model")
+        if self.tuned_lens_path is not None:
+            if self.snapshot_profile != SNAPSHOT_PROFILE:
+                raise ValueError("Tuned Lens requires the split18-30-v1 profile")
+            if not self.tuned_lens_path.is_file():
+                raise ValueError("tuned_lens file is missing")
+            from unridden.api.snapshots.lens import TunedLensArtifact
+
+            lens = TunedLensArtifact.model_validate_json(
+                self.tuned_lens_path.read_text(encoding="utf-8")
+            )
+            lens.require_releasable(expected_model_sha256=model_sha256)
         manifest = read_manifest(self.manifest_path)
         executable, runtime_dir = resolve_manifest_paths(manifest, self.manifest_path)
         revision = manifest.get("llama_revision")
@@ -275,10 +294,6 @@ class SnapshotNativeBackend:
         runtime_sha256 = bundle_digest(typed_checksums)
         if runtime_sha256 != manifest.get("runtime_bundle_sha256"):
             raise ValueError("runtime bundle hash differs from manifest")
-        model_sha256 = digest(self.model_path)
-        expected = self.expected_model_sha256
-        if expected is not None and model_sha256 != expected:
-            raise ValueError("model hash differs from the configured model")
         is_tested_revision(revision)
         return VerifiedInstall(model_sha256, runtime_sha256, runtime_dir, revision)
 
@@ -323,6 +338,8 @@ class SnapshotNativeBackend:
             # Omitted for the default so a pre-0009 worker still starts.
             if self.snapshot_profile != SNAPSHOT_PROFILE:
                 command.extend(["--profile", self.snapshot_profile])
+            if self.tuned_lens_path is not None:
+                command.extend(["--tuned-lens", str(self.tuned_lens_path)])
             environment = os.environ.copy()
             library_path = environment.get("LD_LIBRARY_PATH")
             environment["LD_LIBRARY_PATH"] = (
@@ -343,6 +360,9 @@ class SnapshotNativeBackend:
                 self._read_json_line(), timeout=self.startup_timeout
             )
             profile = WorkerHello.model_validate(raw)
+            expected_early_head = (
+                "tuned-lens-v1" if self.tuned_lens_path is not None else "none"
+            )
             if (
                 profile.model_sha256 != installed.model_sha256
                 or profile.runtime_sha256 != installed.runtime_sha256
@@ -352,6 +372,7 @@ class SnapshotNativeBackend:
                 or profile.threads != self.threads
                 or profile.reference_context != self.reference_context
                 or profile.profile != self.snapshot_profile
+                or profile.early_head != expected_early_head
             ):
                 raise SnapshotProtocolError(
                     "worker handshake differs from configuration"

@@ -129,7 +129,7 @@ class Limits(Advertisement):
 
 class Capabilities(Advertisement):
     operations: list[str]
-    readout_blocks: list[int] = Field(min_length=1, max_length=1)
+    readout_blocks: list[int] = Field(min_length=1, max_length=2)
     generation: Literal[False]
 
 
@@ -568,6 +568,11 @@ class HarnessService:
             result.usage.input_tokens += additional.usage.input_tokens
             usage, extra = result.snapshot_usage, additional.snapshot_usage
             usage.suffix_tokens.update(extra.suffix_tokens)
+            if extra.readout_source is not None:
+                if usage.readout_source is None:
+                    usage.readout_source = dict(extra.readout_source)
+                else:
+                    usage.readout_source.update(extra.readout_source)
             usage.block_tokens.lower += extra.block_tokens.lower
             usage.block_tokens.upper += extra.block_tokens.upper
             usage.reused_prefix_tokens += extra.reused_prefix_tokens

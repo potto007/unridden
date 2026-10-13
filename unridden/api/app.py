@@ -119,6 +119,7 @@ class ApiConfig:
     # split18-30-v1 (26B-A4B, early checkpoint and promotion) or full-v1 (any
     # Gemma 4, one whole-model checkpoint; ADR 0009).
     snapshot_profile: Literal["split18-30-v1", "full-v1"] = "split18-30-v1"
+    snapshot_tuned_lens_path: Path | None = None
 
     def __post_init__(self) -> None:
         positive = {
@@ -261,6 +262,7 @@ def _default_snapshot_backend(config: ApiConfig) -> SnapshotBackend:
         threads=config.threads,
         reference=config.snapshot_reference,
         snapshot_profile=config.snapshot_profile,
+        tuned_lens_path=config.snapshot_tuned_lens_path,
         max_response_bytes=config.max_response_bytes,
         default_timeout=config.request_timeout,
         startup_timeout=config.startup_timeout,
