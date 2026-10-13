@@ -23,6 +23,16 @@ from pathlib import Path
 from typing import Any
 
 from unridden.api.app import ApiConfig, ApiService, BackendFactory, _default_backend
+from unridden.api.gate import (
+    area_under_risk_coverage,
+    brier_toplabel,
+    expected_calibration_error,
+)
+from unridden.api.mapping import (
+    entropy_concentration,
+    normalized_entropy,
+    probability_margin,
+)
 from unridden.api.schema import (
     Answer,
     ChoiceAnswer,
@@ -550,8 +560,60 @@ def metric_block(outcomes: Sequence[Outcome], rankings: Sequence[RankOutcome]) -
                 [item.confidence for item in outcomes if not item.correct]
             ),
         },
+        "selective_prediction": _selective_prediction_block(outcomes),
         "reliability": reliability_table(outcomes),
         "majority_baseline": majority_baseline(outcomes),
+    }
+
+
+def _selective_prediction_block(outcomes: Sequence[Outcome]) -> Row:
+    if not outcomes:
+        return {
+            "ece": None,
+            "equal_mass_ece": None,
+            "brier_toplabel": None,
+            "aurc_confidence": None,
+            "aurc_probability_margin": None,
+            "aurc_entropy_concentration": None,
+            "mean_margin_on_correct": None,
+            "mean_margin_on_incorrect": None,
+            "mean_normalized_entropy_on_correct": None,
+            "mean_normalized_entropy_on_incorrect": None,
+        }
+    confidences = [item.confidence for item in outcomes]
+    corrects = [item.correct for item in outcomes]
+    margins = [
+        probability_margin(list(item.probabilities.values())) for item in outcomes
+    ]
+    entropies = [
+        normalized_entropy(list(item.probabilities.values())) for item in outcomes
+    ]
+    concentrations = [
+        entropy_concentration(list(item.probabilities.values())) for item in outcomes
+    ]
+    return {
+        "ece": expected_calibration_error(confidences, corrects, bins=RELIABILITY_BINS),
+        "equal_mass_ece": expected_calibration_error(
+            confidences, corrects, bins=RELIABILITY_BINS, equal_mass=True
+        ),
+        "brier_toplabel": brier_toplabel(confidences, corrects),
+        "aurc_confidence": area_under_risk_coverage(confidences, corrects),
+        "aurc_probability_margin": area_under_risk_coverage(margins, corrects),
+        "aurc_entropy_concentration": area_under_risk_coverage(
+            concentrations, corrects
+        ),
+        "mean_margin_on_correct": mean(
+            [m for m, item in zip(margins, outcomes, strict=True) if item.correct]
+        ),
+        "mean_margin_on_incorrect": mean(
+            [m for m, item in zip(margins, outcomes, strict=True) if not item.correct]
+        ),
+        "mean_normalized_entropy_on_correct": mean(
+            [e for e, item in zip(entropies, outcomes, strict=True) if item.correct]
+        ),
+        "mean_normalized_entropy_on_incorrect": mean(
+            [e for e, item in zip(entropies, outcomes, strict=True) if not item.correct]
+        ),
     }
 
 

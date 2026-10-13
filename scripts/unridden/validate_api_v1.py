@@ -154,6 +154,28 @@ def audit_diagnostics(
             )
             <= TOLERANCE
         )
+        sorted_raw = sorted(raw, reverse=True)
+        assert (
+            abs(detail["logit_margin"] - (sorted_raw[0] - sorted_raw[1])) <= TOLERANCE
+        )
+        sorted_probs = sorted(ordered, reverse=True)
+        assert (
+            abs(
+                probability(detail["probability_margin"])
+                - (sorted_probs[0] - sorted_probs[1])
+            )
+            <= TOLERANCE
+        )
+        expected_entropy = -sum(p * math.log(p) for p in ordered if p > 0) / math.log(
+            len(ordered)
+        )
+        assert (
+            abs(
+                probability(detail["normalized_entropy"])
+                - min(1.0, max(0.0, expected_entropy))
+            )
+            <= TOLERANCE
+        )
         assert detail["cache_cleared"] is (detail["reused_tokens"] == 0)
         assert (
             detail["processed_tokens"] + detail["reused_tokens"]

@@ -234,12 +234,19 @@ def test_mapping_returns_typed_answers_and_literal_score_expectation() -> None:
     assert response.diagnostics is not None
     diagnostic = response.diagnostics["route"]
     assert diagnostic.token_mapping == {"A": 101, "B": 102}
+    assert diagnostic.logit_margin == pytest.approx(math.log(3.0))
+    assert diagnostic.probability_margin == pytest.approx(0.5)
+    assert diagnostic.normalized_entropy == pytest.approx(
+        -(0.25 * math.log(0.25) + 0.75 * math.log(0.75)) / math.log(2.0)
+    )
     assert diagnostic.conditional_score_semantics == (
         "softmax_over_allowed_single_token_labels_v1"
     )
     assert diagnostic.prompt_version == PROMPT_VERSION
     assert (diagnostic.cache_cleared, diagnostic.reused_tokens) == (True, 0)
     reused = response.diagnostics["severity"]
+    assert reused.logit_margin == pytest.approx(math.log(0.5) - math.log(0.3))
+    assert reused.probability_margin == pytest.approx(0.2)
     assert (reused.prompt_tokens, reused.processed_tokens) == (20, 8)
     assert (reused.cache_cleared, reused.reused_tokens) == (False, 12)
 
