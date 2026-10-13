@@ -80,6 +80,45 @@ Token single_suffix_token(
     return extended.back();
 }
 
+enum class steering_scope { all, last };
+
+// Adds `alpha * direction` to every row of a [rows, width] residual matrix, or
+// to its final row only, in place. The arithmetic is done on a copy and only
+// committed once every result is finite, so a rejected steer leaves the rows
+// exactly as they were.
+inline void apply_steering(
+        std::vector<float> & rows,
+        size_t width,
+        const std::vector<float> & direction,
+        double alpha,
+        steering_scope scope) {
+    if (width == 0 || rows.empty() || rows.size() % width != 0) {
+        throw std::runtime_error("Steering rows are not a matrix of the given width");
+    }
+    if (direction.size() != width) {
+        throw std::runtime_error("Steering direction width differs from the rows");
+    }
+    if (!std::isfinite(alpha)) throw std::runtime_error("Steering alpha is nonfinite");
+    for (const float value : direction) {
+        if (!std::isfinite(value)) throw std::runtime_error("Steering direction is nonfinite");
+    }
+    std::vector<float> steered = rows;
+    const size_t row_count = rows.size() / width;
+    const size_t first = scope == steering_scope::last ? row_count - 1 : 0;
+    for (size_t row = first; row < row_count; ++row) {
+        for (size_t index = 0; index < width; ++index) {
+            const float value = static_cast<float>(
+                static_cast<double>(steered[row * width + index])
+                + alpha * static_cast<double>(direction[index]));
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("Steering produced a nonfinite residual");
+            }
+            steered[row * width + index] = value;
+        }
+    }
+    rows = std::move(steered);
+}
+
 inline std::vector<size_t> prefill_chunks(size_t token_count, size_t batch_size) {
     if (token_count == 0 || batch_size == 0) {
         throw std::runtime_error("Token and batch counts must be positive");

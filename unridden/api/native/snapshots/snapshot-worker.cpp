@@ -38,6 +38,7 @@ extern "C" {
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -335,6 +336,60 @@ std::vector<float> decode_lens_tensor(
     return values;
 }
 
+// Strict inverse of `base64` for one little-endian f32 vector of `width`
+// values, the transport a steering direction arrives in. Anything the
+// encoder could not have produced is refused.
+std::vector<float> base64_decode_f32(const std::string & encoded, size_t width) {
+    if (encoded.empty() || encoded.size() % 4 != 0) {
+        throw std::runtime_error("Steering vector is not valid base64");
+    }
+    const auto sextet = [](char value) -> int {
+        if (value >= 'A' && value <= 'Z') return value - 'A';
+        if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+        if (value >= '0' && value <= '9') return value - '0' + 52;
+        if (value == '+') return 62;
+        if (value == '/') return 63;
+        return -1;
+    };
+    std::vector<unsigned char> raw;
+    raw.reserve(encoded.size() / 4 * 3);
+    for (size_t index = 0; index < encoded.size(); index += 4) {
+        const bool final_group = index + 4 == encoded.size();
+        int values[4] = {0, 0, 0, 0};
+        int padding = 0;
+        for (size_t slot = 0; slot < 4; ++slot) {
+            const char value = encoded[index + slot];
+            if (value == '=') {
+                if (!final_group || slot < 2) {
+                    throw std::runtime_error("Steering vector is not valid base64");
+                }
+                ++padding;
+                continue;
+            }
+            if (padding > 0 || (values[slot] = sextet(value)) < 0) {
+                throw std::runtime_error("Steering vector is not valid base64");
+            }
+        }
+        if (padding > 2) throw std::runtime_error("Steering vector is not valid base64");
+        const uint32_t triple = (static_cast<uint32_t>(values[0]) << 18)
+            | (static_cast<uint32_t>(values[1]) << 12)
+            | (static_cast<uint32_t>(values[2]) << 6)
+            | static_cast<uint32_t>(values[3]);
+        raw.push_back(static_cast<unsigned char>((triple >> 16) & 0xff));
+        if (padding < 2) raw.push_back(static_cast<unsigned char>((triple >> 8) & 0xff));
+        if (padding < 1) raw.push_back(static_cast<unsigned char>(triple & 0xff));
+    }
+    if (raw.size() != width * sizeof(float)) {
+        throw std::runtime_error("Steering vector byte length does not match its shape");
+    }
+    std::vector<float> values(width);
+    std::memcpy(values.data(), raw.data(), raw.size());
+    for (const float value : values) {
+        if (!std::isfinite(value)) throw std::runtime_error("Steering vector is nonfinite");
+    }
+    return values;
+}
+
 std::unique_ptr<unridden::tuned_lens_model> load_tuned_lens(
         const std::string & path,
         const settings & config,
@@ -398,7 +453,6 @@ std::unique_ptr<unridden::tuned_lens_model> load_tuned_lens(
     lens->validate();
     return lens;
 }
-
 json vector_json(const float * rows, size_t row_count, size_t width, const std::string & representation) {
     for (size_t index = 0; index < row_count * width; ++index) {
         if (!std::isfinite(rows[index])) throw std::runtime_error("Nonfinite exported vector");
@@ -415,6 +469,12 @@ json vector_json(const float * rows, size_t row_count, size_t width, const std::
 
 using blob = std::vector<uint8_t>;
 using matrix = std::vector<float>;
+
+struct steering_spec {
+    double alpha;
+    unridden::steering_scope scope;
+    std::vector<float> direction;  // [n_embd], in raw H18 residual space
+};
 
 struct readout {
     std::vector<double> label_logits;
@@ -933,6 +993,53 @@ private:
         return result;
     }
 
+    // The request's optional H18 steering, validated in preflight exactly as
+    // the Python schema validated it; a disagreement is a compiler bug, not
+    // the caller's fault. Steering needs the split boundary, so a whole-model
+    // worker refuses it as a capability it does not have.
+    std::optional<steering_spec> parse_steering(const json & request) {
+        if (!request.contains("steering") || request.at("steering").is_null()) {
+            return std::nullopt;
+        }
+        if (runtime_.full()) {
+            throw protocol_error(
+                "capability_unavailable", "", "H18 steering needs the split profile");
+        }
+        const json & spec = request.at("steering");
+        steering_spec result;
+        result.alpha = spec.at("alpha").get<double>();
+        if (!std::isfinite(result.alpha)) throw invalid("internal", "Steering alpha is nonfinite");
+        const std::string scope = spec.value("scope", std::string("all"));
+        if (scope == "all") {
+            result.scope = unridden::steering_scope::all;
+        } else if (scope == "last") {
+            result.scope = unridden::steering_scope::last;
+        } else {
+            throw invalid("internal", "Unknown steering scope");
+        }
+        const json & vector = spec.at("vector");
+        if (vector.at("dtype").get<std::string>() != "f32"
+                || vector.value("byte_order", std::string("little")) != "little") {
+            throw invalid("internal", "Steering vector must be little-endian f32");
+        }
+        const json & shape = vector.at("shape");
+        const size_t width = static_cast<size_t>(runtime_.n_embd());
+        if (!shape.is_array() || shape.size() != 1
+                || shape.at(0).get<size_t>() != width) {
+            throw invalid("internal", "Steering vector width differs from n_embd");
+        }
+        try {
+            result.direction = base64_decode_f32(vector.at("base64").get<std::string>(), width);
+        } catch (const std::exception & error) {
+            throw invalid("internal", error.what());
+        }
+        if (std::all_of(result.direction.begin(), result.direction.end(),
+                        [](float value) { return value == 0.0f; })) {
+            throw invalid("internal", "Steering vector must not be all zeros");
+        }
+        return result;
+    }
+
     // Frozen tokens for a context freeze: the prompt through the marked bytes
     // of the last user message, minus the final token, which could merge with
     // whatever follows. Same rule as the v1 shared-prefix split.
@@ -1224,14 +1331,26 @@ private:
         }
         const std::string new_id = request.at("new_id").get<std::string>();
         require_fresh(new_id);
+        const auto steering = parse_steering(request);
         const auto started = steady_clock::now();
         snapshot child;
         try {
             // Upper blocks only: the lower K/V is the parent's, by reference.
+            // A steered promotion steers a copy of the parent's H18 rows; the
+            // parent's shared matrix is never mutated.
+            matrix steered;
+            const matrix * boundary = parent.h18.get();
+            if (steering) {
+                steered = *parent.h18;
+                unridden::apply_steering(
+                    steered, static_cast<size_t>(runtime_.n_embd()),
+                    steering->direction, steering->alpha, steering->scope);
+                boundary = &steered;
+            }
             runtime_.clear();
             runtime_.make_resident(parent);
             child.h30 = std::make_shared<const matrix>(
-                runtime_.run_upper(*parent.h18, 0, child.last_normalized, nullptr));
+                runtime_.run_upper(*boundary, 0, child.last_normalized, nullptr));
             child.upper_kv = std::make_shared<const blob>(runtime_.save_state(true));
         } catch (const protocol_error &) {
             throw;
@@ -1269,7 +1388,8 @@ private:
     };
 
     branch_result run_branch(const snapshot & parent, const rendered & full, size_t suffix,
-                             const std::string & save_as) {
+                             const std::string & save_as,
+                             const std::optional<steering_spec> & steering) {
         branch_result result;
         const size_t n = parent.tokens.size();
         auto mark = steady_clock::now();
@@ -1278,7 +1398,15 @@ private:
         const double restore_ms = elapsed_ms(mark);
         mark = steady_clock::now();
         const bool whole = runtime_.full();
-        const matrix h18_q = whole ? matrix() : runtime_.run_lower(full.tokens, n, full.tokens.size());
+        matrix h18_q = whole ? matrix() : runtime_.run_lower(full.tokens, n, full.tokens.size());
+        // The branch's own suffix rows, steered host-side at the boundary
+        // (ADR 0011). A saved child stores these steered rows, so its H18 is
+        // exactly what its upper K/V and H30 were computed from.
+        if (steering && !whole) {
+            unridden::apply_steering(
+                h18_q, static_cast<size_t>(runtime_.n_embd()),
+                steering->direction, steering->alpha, steering->scope);
+        }
         const matrix h30_q = whole
             ? runtime_.run_full(full.tokens, n, full.tokens.size(), result.last_normalized, &result.vocabulary)
             : runtime_.run_upper(h18_q, static_cast<llama_pos>(n), result.last_normalized, &result.vocabulary);
@@ -1330,6 +1458,7 @@ private:
             size_t suffix,
             const std::vector<int> & question_label_ids,
             const std::string & save_as,
+            const std::optional<steering_spec> & steering,
             readout & early_readout,
             bool & used_early_readout) {
         if (!lens_) {
@@ -1342,8 +1471,12 @@ private:
         double restore_ms = elapsed_ms(mark);
 
         mark = steady_clock::now();
-        const matrix h18_q = runtime_.run_lower(full.tokens, n, full.tokens.size());
+        matrix h18_q = runtime_.run_lower(full.tokens, n, full.tokens.size());
         const size_t width = static_cast<size_t>(runtime_.n_embd());
+        if (steering) {
+            unridden::apply_steering(
+                h18_q, width, steering->direction, steering->alpha, steering->scope);
+        }
         const float * h18_last = h18_q.data() + h18_q.size() - width;
 
         std::vector<float> h30_pred;
@@ -1446,6 +1579,7 @@ private:
                 throw protocol_error("capability_unavailable", "", "Evaluate needs a 30 snapshot; promote first");
             }
         }
+        const auto steering = parse_steering(request);
         const auto & rows = request.at("questions");
         if (!rows.is_array() || rows.empty() || rows.size() > 32) throw invalid("internal", "Invalid question count");
         struct prepared {
@@ -1486,12 +1620,12 @@ private:
                 if (early_mode) {
                     bool used_early = false;
                     branch = run_branch_early(
-                        parent, item.full, item.suffix, item.label_ids, item.save_as, value, used_early);
+                        parent, item.full, item.suffix, item.label_ids, item.save_as, steering, value, used_early);
                     if (!used_early) {
                         value = make_readout(branch.vocabulary, item.label_ids, 0);
                     }
                 } else {
-                    branch = run_branch(parent, item.full, item.suffix, item.save_as);
+                    branch = run_branch(parent, item.full, item.suffix, item.save_as, steering);
                     branch.accounting["readout_source"] = runtime_.full() ? "full" : "final_30";
                     value = make_readout(branch.vocabulary, item.label_ids, 0);
                 }
@@ -1535,6 +1669,7 @@ private:
         if (parent.completed_blocks != runtime_.n_layer()) {
             throw protocol_error("capability_unavailable", "", "state_eval needs a 30 snapshot; promote first");
         }
+        const auto steering = parse_steering(request);
         const rendered full = render(request.at("messages"), request.at("answer_prefix").get<std::string>());
         const size_t suffix = branch_suffix(parent, full);
         std::set<std::string> exports;
@@ -1554,7 +1689,7 @@ private:
         const auto started = steady_clock::now();
         branch_result branch;
         try {
-            branch = run_branch(parent, full, suffix, save_as);
+            branch = run_branch(parent, full, suffix, save_as, steering);
         } catch (const protocol_error &) {
             throw;
         } catch (const std::exception & error) {
@@ -2131,6 +2266,7 @@ int main(int argc, char ** argv) {
             {"generated_tokens", 0},
             {"rider_mode", true},
             {"early_head", early_head},
+            {"steering_mode", !config.full},
             {"callbacks_enabled", false},
         };
         std::cout << hello.dump() << '\n' << std::flush;

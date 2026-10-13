@@ -168,6 +168,90 @@ class SnapshotRef(StrictModel):
     relationship: Relationship
 
 
+def _decode_f32(shape: list[int], encoded: str) -> list[float]:
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("vector is not valid base64") from error
+    count = 1
+    for dimension in shape:
+        count *= dimension
+    if len(raw) != count * 4:
+        raise ValueError("vector byte length does not match its shape")
+    values = list(struct.unpack(f"<{count}f", raw))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("vector contains nonfinite values")
+    return values
+
+
+# Which H18 rows a steering direction is added to: every row the branch (or
+# promotion) feeds the upper range, or only the final row, the one whose
+# continuation the readout reads.
+type SteeringScope = Literal["all", "last"]
+
+
+class SteeringVector(StrictModel):
+    """One H18 direction, transported like an exported vector artifact.
+
+    Unlike `VectorArtifact` it carries no representation tag: it is a
+    caller-supplied direction in `raw_residual_after_block_18` space, not a
+    captured residual. The width must match the running profile's `n_embd`;
+    the service checks that, the schema only the shape.
+    """
+
+    dtype: Literal["f32"]
+    byte_order: Literal["little"] = "little"
+    shape: list[int] = Field(min_length=1, max_length=1)
+    base64: str
+
+    @field_validator("shape")
+    @classmethod
+    def _positive_width(cls, value: list[int]) -> list[int]:
+        if value[0] < 1:
+            raise ValueError("steering vector width must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _decodes_and_nonzero(self) -> Self:
+        # An all-zero direction can only be an extraction bug; refusing it
+        # keeps a silently unsteered run out of experiment results.
+        if all(value == 0.0 for value in self.values()):
+            raise ValueError("steering vector must not be all zeros")
+        return self
+
+    @property
+    def width(self) -> int:
+        return self.shape[0]
+
+    def values(self) -> list[float]:
+        return _decode_f32(self.shape, self.base64)
+
+    @classmethod
+    def from_values(cls, values: list[float]) -> Self:
+        encoded = base64.b64encode(struct.pack(f"<{len(values)}f", *values)).decode()
+        return cls(dtype="f32", shape=[len(values)], base64=encoded)
+
+
+class H18Steering(StrictModel):
+    """Host-side residual steering at the split boundary (ADR 0011).
+
+    The worker adds `alpha * vector` to the H18 rows it is about to run
+    through the upper blocks, on a copy: the parent snapshot's own H18 is a
+    shared immutable record and is never mutated.
+    """
+
+    alpha: float
+    scope: SteeringScope = "all"
+    vector: SteeringVector
+
+    @field_validator("alpha")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("steering alpha must be finite")
+        return value
+
+
 class Readout(StrictModel):
     completed_blocks: Checkpoint
 
@@ -178,6 +262,7 @@ class V2DecisionRequest(StrictModel):
     questions: dict[str, Question] = Field(min_length=1, max_length=32)
     readout: Readout
     save_result_snapshot: bool = False
+    steering: H18Steering | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -238,22 +323,6 @@ class V2DecisionResponse(StrictModel):
     answers: dict[str, Answer]
     usage: Usage
     snapshot_usage: SnapshotUsage
-
-
-def _decode_f32(shape: list[int], encoded: str) -> list[float]:
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("vector is not valid base64") from error
-    count = 1
-    for dimension in shape:
-        count *= dimension
-    if len(raw) != count * 4:
-        raise ValueError("vector byte length does not match its shape")
-    values = list(struct.unpack(f"<{count}f", raw))
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("vector contains nonfinite values")
-    return values
 
 
 class VectorArtifact(StrictModel):
@@ -319,6 +388,7 @@ class StateEvaluationRequest(StrictModel):
     prompt: str = Field(min_length=1)
     readout: StateReadout
     save_result_snapshot: bool = False
+    steering: H18Steering | None = None
 
 
 class StateEvaluationResponse(StrictModel):
@@ -734,6 +804,9 @@ class WorkerHello(StrictModel):
     # A worker built with the `ride` command; older workers omit it.
     rider_mode: bool = False
     early_head: EarlyHeadName = "none"
+    # A worker that applies H18 steering; older workers omit it and must
+    # never be sent a steering spec they would silently ignore.
+    steering_mode: bool = False
     callbacks_enabled: Literal[False]
 
     @model_validator(mode="after")
@@ -834,6 +907,7 @@ __all__ = [
     "DecisionInput",
     "EarlyHeadName",
     "ExportKind",
+    "H18Steering",
     "Persistence",
     "Promotion",
     "ProfileName",
@@ -854,6 +928,8 @@ __all__ = [
     "StateEvaluationRequest",
     "StateEvaluationResponse",
     "StateReadout",
+    "SteeringScope",
+    "SteeringVector",
     "TopLogit",
     "V2DecisionRequest",
     "V2DecisionResponse",

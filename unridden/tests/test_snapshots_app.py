@@ -68,6 +68,7 @@ HELLO = WorkerHello(
     context_prompt_version="unridden-gemma-context-v1",
     generated_tokens=0,
     rider_mode=True,
+    steering_mode=True,
     callbacks_enabled=False,
 )
 
@@ -140,6 +141,7 @@ class FakeSnapshotBackend:
         self.profile: WorkerHello | None = None
         self.ready = False
         self.promote_calls = 0
+        self.steering_seen: list[Any] = []
         self._snaps: dict[str, dict[str, Any]] = {}
         self._resident: set[str] = set()
         self.block = asyncio.Event()
@@ -253,9 +255,15 @@ class FakeSnapshotBackend:
         )
 
     async def promote(
-        self, *, snapshot_id: str, new_id: str, timeout: float | None = None
+        self,
+        *,
+        snapshot_id: str,
+        new_id: str,
+        steering: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> WorkerPromoted:
         self.promote_calls += 1
+        self.steering_seen.append(steering)
         parent = self._snaps[snapshot_id]
         tokens = parent["tokens"]
         kind = parent["kind"]
@@ -352,8 +360,10 @@ class FakeSnapshotBackend:
         snapshot_id: str,
         readout_blocks: int,
         questions: list[dict[str, Any]],
+        steering: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> WorkerResult:
+        self.steering_seen.append(steering)
         if self.gate:
             self.entered.set()
             await self.block.wait()
@@ -378,8 +388,10 @@ class FakeSnapshotBackend:
         export: list[ExportKind],
         top_logits: int,
         save_as: str | None,
+        steering: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> WorkerState:
+        self.steering_seen.append(steering)
         content = "".join(message["content"] for message in messages) + answer_prefix
         suffix = _tokens([m["content"] for m in messages if m["role"] == "user"][-1])
         reused = self._snaps[snapshot_id]["tokens"]
@@ -954,8 +966,86 @@ async def test_models_reports_profile_and_no_early_head(tmp_path: Path) -> None:
     profile = models.json()["models"][0]
     assert profile["profile"] == "split18-30-v1"
     assert profile["capabilities"]["early_head"] == "none"
+    assert profile["capabilities"]["h18_steering"] is True
     assert profile["capabilities"]["readout_blocks"] == [30]
     assert profile["capabilities"]["generation"] is False
+
+
+def _steering_body(width: int = HELLO.n_embd) -> dict[str, Any]:
+    encoded = base64.b64encode(struct.pack(f"<{width}f", *([0.01] * width))).decode()
+    return {
+        "alpha": 0.5,
+        "scope": "last",
+        "vector": {"dtype": "f32", "shape": [width], "base64": encoded},
+    }
+
+
+@pytest.mark.asyncio
+async def test_steered_decision_and_state_eval_reach_the_worker(
+    tmp_path: Path,
+) -> None:
+    backend = FakeSnapshotBackend()
+    async with client_for(backend, tmp_path) as client:
+        created = (await client.post("/v2/snapshots", json=CONTEXT_BODY)).json()
+        snap30 = next(
+            r["id"] for r in created["snapshots"] if r["completed_blocks"] == 30
+        )
+        plain = await client.post("/v2/decisions", json=_decision(snap30))
+        steered = await client.post(
+            "/v2/decisions", json=_decision(snap30, steering=_steering_body())
+        )
+        state = await client.post(
+            "/v2/state-evaluations",
+            json={
+                "snapshot": {"id": snap30, "relationship": "followup"},
+                "prompt": "focus on the hazard",
+                "readout": {"completed_blocks": 30},
+                "steering": _steering_body(),
+            },
+        )
+
+    assert plain.status_code == steered.status_code == state.status_code == 200
+    assert backend.steering_seen[0] is None
+    seen = backend.steering_seen[1]
+    assert seen["alpha"] == 0.5 and seen["scope"] == "last"
+    assert seen["vector"]["shape"] == [HELLO.n_embd]
+    assert backend.steering_seen[2] == seen
+    # Steering is per branch (ADR 0011): no promotion was steered.
+    assert backend.promote_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_steering_refused_for_wrong_width_and_unsteerable_worker(
+    tmp_path: Path,
+) -> None:
+    backend = FakeSnapshotBackend()
+    async with client_for(backend, tmp_path) as client:
+        created = (await client.post("/v2/snapshots", json=CONTEXT_BODY)).json()
+        snap18 = next(
+            r["id"] for r in created["snapshots"] if r["completed_blocks"] == 18
+        )
+        wrong_width = await client.post(
+            "/v2/decisions", json=_decision(snap18, steering=_steering_body(4))
+        )
+    assert wrong_width.status_code == 422, wrong_width.text
+    # Refused before planning: the 18 parent was never promoted.
+    assert backend.promote_calls == 0
+    assert backend.steering_seen == []
+
+    legacy = FakeSnapshotBackend()
+    legacy.hello = HELLO.model_copy(update={"steering_mode": False})
+    async with client_for(legacy, tmp_path / "legacy") as client:
+        created = (await client.post("/v2/snapshots", json=CONTEXT_BODY)).json()
+        snap30 = next(
+            r["id"] for r in created["snapshots"] if r["completed_blocks"] == 30
+        )
+        refused = await client.post(
+            "/v2/decisions", json=_decision(snap30, steering=_steering_body())
+        )
+        models = await client.get("/v2/models")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == "capability_unavailable"
+    assert models.json()["models"][0]["capabilities"]["h18_steering"] is False
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 #include "worker-utils.h"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -44,6 +45,40 @@ int main() {
             rejected = true;
         }
         check(rejected);
+    }
+    {
+        std::vector<float> rows{1.0f, 2.0f, 3.0f, 4.0f};
+        unridden::apply_steering(
+            rows, 2, {10.0f, 100.0f}, 0.5, unridden::steering_scope::all);
+        check((rows == std::vector<float>{6.0f, 52.0f, 8.0f, 54.0f}));
+    }
+    {
+        std::vector<float> rows{1.0f, 2.0f, 3.0f, 4.0f};
+        unridden::apply_steering(
+            rows, 2, {10.0f, 100.0f}, 1.0, unridden::steering_scope::last);
+        check((rows == std::vector<float>{1.0f, 2.0f, 13.0f, 104.0f}));
+        unridden::apply_steering(
+            rows, 2, {10.0f, 100.0f}, 0.0, unridden::steering_scope::all);
+        check((rows == std::vector<float>{1.0f, 2.0f, 13.0f, 104.0f}));
+    }
+    {
+        // Every rejection leaves the rows untouched.
+        const auto rejected = [](std::vector<float> rows, size_t width,
+                                 const std::vector<float> & direction, double alpha) {
+            const std::vector<float> before = rows;
+            try {
+                unridden::apply_steering(
+                    rows, width, direction, alpha, unridden::steering_scope::all);
+            } catch (const std::runtime_error &) {
+                return rows == before;
+            }
+            return false;
+        };
+        check(rejected({1.0f, 2.0f}, 2, {1.0f}, 1.0));
+        check(rejected({1.0f, 2.0f, 3.0f}, 2, {1.0f, 1.0f}, 1.0));
+        check(rejected({}, 1, {1.0f}, 1.0));
+        check(rejected({1.0f}, 1, {1.0f}, std::numeric_limits<double>::infinity()));
+        check(rejected({1e38f}, 1, {1e38f}, 10.0));
     }
     {
         const auto chunks = unridden::prefill_chunks(513, 256);

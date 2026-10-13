@@ -115,7 +115,12 @@ class SnapshotBackend(Protocol):
     ) -> WorkerCreated: ...
 
     async def promote(
-        self, *, snapshot_id: str, new_id: str, timeout: float
+        self,
+        *,
+        snapshot_id: str,
+        new_id: str,
+        steering: dict[str, Any] | None,
+        timeout: float,
     ) -> WorkerPromoted: ...
 
     async def evaluate(
@@ -124,6 +129,7 @@ class SnapshotBackend(Protocol):
         snapshot_id: str,
         readout_blocks: Checkpoint,
         questions: list[dict[str, Any]],
+        steering: dict[str, Any] | None,
         timeout: float,
     ) -> WorkerResult: ...
 
@@ -136,6 +142,7 @@ class SnapshotBackend(Protocol):
         export: list[ExportKind],
         top_logits: int,
         save_as: str | None,
+        steering: dict[str, Any] | None,
         timeout: float,
     ) -> WorkerState: ...
 
@@ -558,10 +565,20 @@ class SnapshotNativeBackend:
         return await self._validated(WorkerCreated, raw)
 
     async def promote(
-        self, *, snapshot_id: str, new_id: str, timeout: float | None = None
+        self,
+        *,
+        snapshot_id: str,
+        new_id: str,
+        steering: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> WorkerPromoted:
         raw = await self._request(
-            {"type": "promote", "snapshot_id": snapshot_id, "new_id": new_id},
+            {
+                "type": "promote",
+                "snapshot_id": snapshot_id,
+                "new_id": new_id,
+                "steering": steering,
+            },
             timeout=timeout,
         )
         return await self._validated(WorkerPromoted, raw)
@@ -572,6 +589,7 @@ class SnapshotNativeBackend:
         snapshot_id: str,
         readout_blocks: Checkpoint,
         questions: list[dict[str, Any]],
+        steering: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> WorkerResult:
         raw = await self._request(
@@ -580,6 +598,7 @@ class SnapshotNativeBackend:
                 "snapshot_id": snapshot_id,
                 "readout_blocks": readout_blocks,
                 "questions": questions,
+                "steering": steering,
             },
             timeout=timeout,
         )
@@ -594,6 +613,7 @@ class SnapshotNativeBackend:
         export: list[ExportKind],
         top_logits: int,
         save_as: str | None,
+        steering: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> WorkerState:
         raw = await self._request(
@@ -605,6 +625,7 @@ class SnapshotNativeBackend:
                 "export": export,
                 "top_logits": top_logits,
                 "save_as": save_as,
+                "steering": steering,
             },
             timeout=timeout,
         )

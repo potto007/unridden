@@ -16,7 +16,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from unridden.api.schema import MODEL_ID, Answer, Usage
 from unridden.api.snapshots.backend import SnapshotBackend
@@ -39,6 +39,7 @@ from unridden.api.snapshots.errors import (
 from unridden.api.snapshots.mapping import map_answer
 from unridden.api.snapshots.schema import (
     BlockTokens,
+    H18Steering,
     Persistence,
     Promotion,
     ReadoutSource,
@@ -91,6 +92,30 @@ def _require_readout(
     allowed = profile.readout_blocks if allow_early else [profile.final_block]
     if blocks not in allowed:
         raise CapabilityUnavailable(f"no registered early head for a {blocks} readout")
+
+
+def _steering_payload(
+    profile: WorkerHello, steering: H18Steering | None
+) -> dict[str, Any] | None:
+    """The worker steering spec, or a refusal before anything runs.
+
+    Steering lives at the split boundary, so a whole-model profile cannot
+    offer it, and a worker without `steering_mode` must never be sent a spec
+    it would silently ignore. Checked before `_plan`, so a refused request
+    has not yet promoted or restored anything.
+    """
+    if steering is None:
+        return None
+    if profile.split_block is None or not profile.steering_mode:
+        raise CapabilityUnavailable(
+            "H18 steering needs a split-profile worker with steering mode"
+        )
+    if steering.vector.width != profile.n_embd:
+        raise SnapshotRequestError(
+            "steering vector width differs from the model embedding",
+            reason="budget",
+        )
+    return steering.model_dump(mode="json")
 
 
 class SnapshotBusyError(RuntimeError):
@@ -374,9 +399,12 @@ class SnapshotService:
             await store.restore(record.id)
             new_id = new_snapshot_id()
             # As for create: a failed promote leaves nothing in the worker.
+            # Promotion is canonical and memoized below, so it is never
+            # steered; steering applies per branch (ADR 0011).
             promoted = await self._backend.promote(
                 snapshot_id=record.id,
                 new_id=new_id,
+                steering=None,
                 timeout=self._request_timeout,
             )
             try:
@@ -517,6 +545,7 @@ class SnapshotService:
     ) -> V2DecisionResponse:
         async with self._serialized() as (profile, store):
             _require_readout(profile, request.readout.completed_blocks)
+            steering = _steering_payload(profile, request.steering)
             plan = await self._plan(
                 profile,
                 store,
@@ -553,6 +582,7 @@ class SnapshotService:
                     snapshot_id=plan.effective_parent,
                     readout_blocks=request.readout.completed_blocks,
                     questions=payloads,
+                    steering=steering,
                     timeout=self._request_timeout,
                 )
                 self._check_result_provenance(
@@ -633,6 +663,7 @@ class SnapshotService:
             _require_readout(
                 profile, request.readout.completed_blocks, allow_early=False
             )
+            steering = _steering_payload(profile, request.steering)
             plan = await self._plan(profile, store, request.snapshot)
             if plan.mode == "context":
                 branch = compile_context_prompt(plan.messages, request.prompt)
@@ -651,6 +682,7 @@ class SnapshotService:
                     export=request.readout.export,
                     top_logits=request.readout.top_logits,
                     save_as=save_id,
+                    steering=steering,
                     timeout=self._request_timeout,
                 )
                 vectors: dict[str, VectorArtifact] = {}
@@ -818,6 +850,9 @@ class SnapshotService:
                             else ["continue", "inspect"]
                         ),
                         "generation": False,
+                        "h18_steering": bool(
+                            profile.split_block is not None and profile.steering_mode
+                        ),
                         "early_head": profile.early_head,
                         "readout_blocks": profile.readout_blocks,
                         "vectors": sorted(_VECTOR_NAMES[profile.profile]),
