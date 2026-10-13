@@ -133,6 +133,9 @@ class FullVocabularyArgmax(StrictModel):
 
 class QuestionDiagnostics(StrictModel):
     raw_label_logits: list[float]
+    logit_margin: float = Field(ge=0.0)
+    probability_margin: float = Field(ge=0.0, le=1.0)
+    normalized_entropy: float = Field(ge=0.0, le=1.0)
     token_mapping: dict[str, int]
     coverage: float = Field(ge=0.0, le=1.0)
     full_vocabulary_argmax: FullVocabularyArgmax

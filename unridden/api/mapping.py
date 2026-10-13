@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from unridden.api.compiler import CompiledBatch
 from unridden.api.schema import (
@@ -19,7 +20,7 @@ from unridden.api.schema import (
 )
 
 
-def stable_softmax(logits: list[float]) -> list[float]:
+def stable_softmax(logits: Sequence[float]) -> list[float]:
     if len(logits) < 2 or not all(math.isfinite(item) for item in logits):
         raise ValueError("label logits must be finite and contain at least two values")
     maximum = max(logits)
@@ -33,6 +34,58 @@ def stable_softmax(logits: list[float]) -> list[float]:
     ) or not math.isclose(sum(probabilities), 1.0, abs_tol=1e-10):
         raise ValueError("label probabilities are invalid")
     return probabilities
+
+
+def logit_margin(logits: Sequence[float]) -> float:
+    """Top-1 minus top-2 raw label logit."""
+    if len(logits) < 2 or not all(math.isfinite(item) for item in logits):
+        raise ValueError("label logits must be finite and contain at least two values")
+    ordered = sorted((float(item) for item in logits), reverse=True)
+    return max(0.0, ordered[0] - ordered[1])
+
+
+def probability_margin(probabilities: Sequence[float]) -> float:
+    """Top-1 minus top-2 label probability in [0.0, 1.0]."""
+    if len(probabilities) < 2 or not all(
+        math.isfinite(item) and 0.0 <= item <= 1.0 for item in probabilities
+    ):
+        raise ValueError(
+            "label probabilities must be finite values in [0, 1] "
+            "with at least two options"
+        )
+    ordered = sorted((float(item) for item in probabilities), reverse=True)
+    return min(1.0, max(0.0, ordered[0] - ordered[1]))
+
+
+def normalized_entropy(probabilities: Sequence[float]) -> float:
+    """Shannon entropy normalized by ln(K), clamped to [0.0, 1.0].
+
+    Returns 0.0 for a point mass (zero uncertainty) and 1.0 for a uniform
+    distribution over K >= 2 options.
+    """
+    if len(probabilities) < 2 or not all(
+        math.isfinite(item) and 0.0 <= item <= 1.0 for item in probabilities
+    ):
+        raise ValueError(
+            "label probabilities must be finite values in [0, 1] "
+            "with at least two options"
+        )
+    entropy = -sum(
+        float(item) * math.log(float(item)) for item in probabilities if item > 0.0
+    )
+    scale = math.log(len(probabilities))
+    if scale <= 0.0:
+        return 0.0
+    return min(1.0, max(0.0, entropy / scale))
+
+
+def entropy_concentration(probabilities: Sequence[float]) -> float:
+    """Normalized entropy concentration 1.0 - H(p) / ln(K), clamped to [0.0, 1.0].
+
+    Returns 1.0 for a point mass (maximum concentration) and 0.0 for a uniform
+    distribution over K >= 2 options.
+    """
+    return min(1.0, max(0.0, 1.0 - normalized_entropy(probabilities)))
 
 
 def map_response(
@@ -108,6 +161,9 @@ def map_response(
         if include_diagnostics:
             diagnostics[compiled.id] = QuestionDiagnostics(
                 raw_label_logits=raw.label_logits,
+                logit_margin=logit_margin(raw.label_logits),
+                probability_margin=probability_margin(probabilities),
+                normalized_entropy=normalized_entropy(probabilities),
                 token_mapping=dict(
                     zip(compiled.labels, raw.label_token_ids, strict=True)
                 ),
