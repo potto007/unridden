@@ -85,6 +85,7 @@ struct settings {
     std::string model_sha256;
     std::string runtime_sha256;
     std::string runtime_dir;
+    std::string tuned_lens_path;
     int context = 2048;
     int batch = 256;
     int ubatch = 256;
@@ -123,7 +124,7 @@ settings parse_args(int argc, char ** argv) {
             if (!flags.insert(key).second) throw std::runtime_error("Repeated " + key);
             continue;
         }
-        const bool optional = key == "--profile";
+        const bool optional = key == "--profile" || key == "--tuned-lens";
         if ((!valued.count(key) && !optional) || index + 1 >= argc || values.count(key)) {
             throw std::runtime_error("Invalid or repeated argument: " + key);
         }
@@ -149,9 +150,13 @@ settings parse_args(int argc, char ** argv) {
     const std::string profile = values.count("--profile") ? values.at("--profile") : PROFILE;
     if (profile != PROFILE && profile != FULL_PROFILE) throw std::runtime_error("Unknown profile " + profile);
     result.full = profile == FULL_PROFILE;
+    result.tuned_lens_path = values.count("--tuned-lens") ? values.at("--tuned-lens") : "";
     // The full-v1 snapshot path already is the stock graph; the reference
     // context exists only to qualify the split against it.
     if (result.full && result.reference) throw std::runtime_error("--reference needs the split profile");
+    if (result.full && !result.tuned_lens_path.empty()) {
+        throw std::runtime_error("--tuned-lens needs the split profile");
+    }
     return result;
 }
 
@@ -267,6 +272,133 @@ std::string base64(const unsigned char * data, size_t size) {
     return out;
 }
 
+std::vector<uint8_t> base64_decode(const std::string & encoded) {
+    if (encoded.empty() || encoded.size() % 4 != 0) {
+        throw std::runtime_error("Invalid base64 length");
+    }
+    auto decode_char = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::vector<uint8_t> out;
+    out.reserve((encoded.size() / 4) * 3);
+    for (size_t index = 0; index < encoded.size(); index += 4) {
+        const int a = decode_char(static_cast<unsigned char>(encoded[index]));
+        const int b = decode_char(static_cast<unsigned char>(encoded[index + 1]));
+        const bool pad2 = encoded[index + 2] == '=';
+        const bool pad3 = encoded[index + 3] == '=';
+        const int c = pad2 ? 0 : decode_char(static_cast<unsigned char>(encoded[index + 2]));
+        const int d = pad3 ? 0 : decode_char(static_cast<unsigned char>(encoded[index + 3]));
+        if (a < 0 || b < 0 || c < 0 || d < 0 || (pad2 && !pad3) ||
+                ((pad2 || pad3) && index + 4 != encoded.size())) {
+            throw std::runtime_error("Invalid base64 payload");
+        }
+        const uint32_t triple = (static_cast<uint32_t>(a) << 18) |
+            (static_cast<uint32_t>(b) << 12) |
+            (static_cast<uint32_t>(c) << 6) |
+            static_cast<uint32_t>(d);
+        out.push_back(static_cast<uint8_t>((triple >> 16) & 0xFF));
+        if (!pad2) out.push_back(static_cast<uint8_t>((triple >> 8) & 0xFF));
+        if (!pad3) out.push_back(static_cast<uint8_t>(triple & 0xFF));
+    }
+    return out;
+}
+
+std::vector<float> decode_lens_tensor(
+        const json & entry,
+        const std::vector<size_t> & expected_shape,
+        const std::string & name) {
+    if (entry.value("dtype", "") != "f32" || entry.value("byte_order", "") != "little") {
+        throw std::runtime_error("Invalid Tuned Lens tensor format for " + name);
+    }
+    const auto shape = entry.at("shape").get<std::vector<size_t>>();
+    if (shape != expected_shape) {
+        throw std::runtime_error("Unexpected Tuned Lens tensor shape for " + name);
+    }
+    size_t count = 1;
+    for (const size_t dim : shape) count *= dim;
+    const auto raw = base64_decode(entry.at("base64").get<std::string>());
+    if (raw.size() != count * sizeof(float)) {
+        throw std::runtime_error("Unexpected Tuned Lens byte count for " + name);
+    }
+    std::vector<float> values(count);
+    std::memcpy(values.data(), raw.data(), raw.size());
+    for (const float value : values) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("Nonfinite Tuned Lens value in " + name);
+        }
+    }
+    return values;
+}
+
+std::unique_ptr<unridden::tuned_lens_model> load_tuned_lens(
+        const std::string & path,
+        const settings & config,
+        int expected_n_embd,
+        const std::vector<int> & worker_label_ids) {
+    std::ifstream stream(path);
+    if (!stream) throw std::runtime_error("Cannot open Tuned Lens artifact: " + path);
+    const json payload = json::parse(stream);
+    if (payload.value("schema_version", "") != "tuned-lens-v1" ||
+            payload.value("profile", "") != PROFILE) {
+        throw std::runtime_error("Unsupported Tuned Lens artifact header");
+    }
+    if (payload.value("model_sha256", "") != config.model_sha256) {
+        throw std::runtime_error("Tuned Lens model_sha256 does not match worker model");
+    }
+    if (payload.value("source_block", 0) != SPLIT_BLOCK ||
+            payload.value("target_block", 0) != EXPECTED_LAYERS) {
+        throw std::runtime_error("Tuned Lens block range does not match split18-30-v1");
+    }
+    if (payload.value("n_embd", 0) != expected_n_embd) {
+        throw std::runtime_error("Tuned Lens n_embd does not match model");
+    }
+    if (!payload.contains("release_gates") ||
+            !payload.at("release_gates").value("passed", false)) {
+        throw std::runtime_error("Tuned Lens artifact did not pass release gates");
+    }
+    auto lens = std::make_unique<unridden::tuned_lens_model>();
+    lens->n_embd = static_cast<size_t>(expected_n_embd);
+    lens->rms_norm_eps = payload.value("rms_norm_eps", 1e-6f);
+    lens->logit_softcap = payload.value(
+        "final_logit_softcapping", payload.value("logit_softcap", 30.0));
+    lens->label_token_ids = payload.at("label_token_ids").get<std::vector<int>>();
+    if (lens->label_token_ids.size() < 2 ||
+            lens->label_token_ids.size() > worker_label_ids.size() ||
+            !std::equal(
+                lens->label_token_ids.begin(),
+                lens->label_token_ids.end(),
+                worker_label_ids.begin())) {
+        throw std::runtime_error("Tuned Lens label_token_ids do not match worker alphabet");
+    }
+    const size_t d = lens->n_embd;
+    const size_t l = lens->label_token_ids.size();
+    const auto & w_entry = payload.contains("w") ? payload.at("w") : payload.at("weight");
+    const auto & b_entry = payload.contains("b") ? payload.at("b") : payload.at("bias");
+    lens->weight = decode_lens_tensor(w_entry, {d, d}, "w");
+    lens->bias = decode_lens_tensor(b_entry, {d}, "b");
+    lens->output_norm = decode_lens_tensor(payload.at("output_norm"), {d}, "output_norm");
+    lens->unembed = decode_lens_tensor(payload.at("unembed"), {l, d}, "unembed");
+
+    const auto & gate_json = payload.at("gate");
+    lens->gate.enabled = gate_json.value("enabled", true);
+    lens->gate.min_logit_margin = gate_json.at("min_logit_margin").get<double>();
+    lens->gate.min_entropy_concentration =
+        gate_json.at("min_entropy_concentration").get<double>();
+    if (gate_json.contains("temperatures")) {
+        for (const auto & [key, value] : gate_json.at("temperatures").items()) {
+            const size_t count = static_cast<size_t>(parse_positive(key, "temperature key"));
+            lens->gate.temperatures.emplace_back(count, value.get<double>());
+        }
+    }
+    lens->validate();
+    return lens;
+}
+
 json vector_json(const float * rows, size_t row_count, size_t width, const std::string & representation) {
     for (size_t index = 0; index < row_count * width; ++index) {
         if (!std::isfinite(rows[index])) throw std::runtime_error("Nonfinite exported vector");
@@ -292,6 +424,7 @@ struct readout {
     double argmax_logit = 0.0;
     std::vector<std::pair<int, double>> top;
 };
+
 
 struct snapshot {
     std::string id;
@@ -522,11 +655,12 @@ public:
         resident_upper_ = false;
     }
 
-    // Leaves seq 0 of lower (and upper, when the snapshot has it) holding the
-    // snapshot's exact tokens. Returns restored bytes; 0 means it was resident.
-    size_t make_resident(const snapshot & item) {
+    // Leaves seq 0 of lower (and upper, when the snapshot has it and need_upper
+    // is true) holding the snapshot's exact tokens. Returns restored bytes;
+    // 0 means it was resident.
+    size_t make_resident(const snapshot & item, bool need_upper = true) {
         const auto held = static_cast<llama_pos>(item.tokens.size()) - 1;
-        const bool want_upper = !config_.full && item.completed_blocks == n_layer_;
+        const bool want_upper = need_upper && !config_.full && item.completed_blocks == n_layer_;
         if (resident_ == item.id && (!want_upper || resident_upper_) &&
                 llama_memory_seq_pos_max(llama_get_memory(lower_.get()), 0) == held &&
                 (!want_upper || llama_memory_seq_pos_max(llama_get_memory(upper_.get()), 0) == held)) {
@@ -543,6 +677,37 @@ public:
         resident_ = item.id;
         resident_upper_ = want_upper;
         return restored;
+    }
+
+    // Populates upper seq 0 for `item` on demand during a Tuned Lens cascade
+    // fallback, either by restoring `item.upper_kv` (30 parent) or running
+    // `*item.h18` through `upper_` (18 parent), without re-running `lower_`.
+    void ensure_upper_resident(
+            const snapshot & item,
+            size_t & restored_bytes,
+            size_t & prefix_upper_tokens) {
+        if (config_.full || !upper_) return;
+        const auto held = static_cast<llama_pos>(item.tokens.size()) - 1;
+        if (resident_ == item.id && resident_upper_ &&
+                llama_memory_seq_pos_max(llama_get_memory(upper_.get()), 0) == held) {
+            return;
+        }
+        llama_memory_clear(llama_get_memory(upper_.get()), true);
+        if (item.upper_kv) {
+            restored_bytes += restore(upper_.get(), *item.upper_kv);
+        } else if (item.h18) {
+            std::vector<float> ignored_norm;
+            (void) run_upper(*item.h18, 0, ignored_norm, nullptr);
+            prefix_upper_tokens += item.tokens.size();
+        } else {
+            clear();
+            throw std::runtime_error("Snapshot cannot populate upper KV for cascade fallback");
+        }
+        if (llama_memory_seq_pos_max(llama_get_memory(upper_.get()), 0) != held) {
+            clear();
+            throw std::runtime_error("Upper context does not hold snapshot prefix after handoff");
+        }
+        resident_upper_ = true;
     }
 
     // Drops everything past the resident snapshot's tokens.
@@ -670,6 +835,36 @@ readout make_readout(const std::vector<double> & vocabulary, const std::vector<i
     return result;
 }
 
+readout make_lens_readout(
+        const std::vector<double> & lens_logits,
+        const std::vector<int> & lens_token_ids,
+        const std::vector<int> & label_ids) {
+    if (label_ids.size() < 2 || label_ids.size() > lens_logits.size() ||
+            lens_logits.size() != lens_token_ids.size() ||
+            !std::equal(label_ids.begin(), label_ids.end(), lens_token_ids.begin())) {
+        throw std::runtime_error("Tuned Lens label mapping mismatch");
+    }
+    readout result;
+    result.label_logits.assign(
+        lens_logits.begin(),
+        lens_logits.begin() + static_cast<std::ptrdiff_t>(label_ids.size()));
+    result.label_token_ids = label_ids;
+    (void) unridden::stable_softmax(result.label_logits);
+    const auto all_probs = unridden::stable_softmax(lens_logits);
+    double mass = 0.0;
+    for (size_t index = 0; index < label_ids.size(); ++index) {
+        mass += all_probs[index];
+    }
+    result.allowed_mass = std::min(1.0, std::max(0.0, mass));
+    size_t best = 0;
+    for (size_t index = 1; index < lens_logits.size(); ++index) {
+        if (lens_logits[index] > lens_logits[best]) best = index;
+    }
+    result.argmax_token = lens_token_ids[best];
+    result.argmax_logit = lens_logits[best];
+    return result;
+}
+
 json top_json(const readout & value) {
     json rows = json::array();
     for (const auto & [token_id, logit] : value.top) rows.push_back({{"token_id", token_id}, {"logit", logit}});
@@ -694,9 +889,12 @@ struct rendered {
 class worker {
 public:
     worker(const settings & config, llama_model * model, const common_chat_templates * templates,
-           std::vector<std::string> labels, std::vector<int> label_ids)
+           std::vector<std::string> labels, std::vector<int> label_ids,
+           std::unique_ptr<unridden::tuned_lens_model> lens)
         : config_(config), runtime_(config, model), templates_(templates),
-          labels_(std::move(labels)), label_ids_(std::move(label_ids)) {}
+          labels_(std::move(labels)), label_ids_(std::move(label_ids)),
+          lens_(std::move(lens)) {}
+
 
     json handle(const json & request) {
         const std::string type = request.at("type").get<std::string>();
@@ -1126,13 +1324,127 @@ private:
         return result;
     }
 
-    json evaluate(const json & request) {
-        const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
-        if (request.at("readout_blocks").get<int>() != runtime_.n_layer()) {
+    branch_result run_branch_early(
+            const snapshot & parent,
+            const rendered & full,
+            size_t suffix,
+            const std::vector<int> & question_label_ids,
+            const std::string & save_as,
+            readout & early_readout,
+            bool & used_early_readout) {
+        if (!lens_) {
             throw protocol_error("capability_unavailable", "", "No registered early head for that block");
         }
-        if (parent.completed_blocks != runtime_.n_layer()) {
-            throw protocol_error("capability_unavailable", "", "Evaluate needs a 30 snapshot; promote first");
+        branch_result result;
+        const size_t n = parent.tokens.size();
+        auto mark = steady_clock::now();
+        size_t restored = runtime_.make_resident(parent, false);
+        double restore_ms = elapsed_ms(mark);
+
+        mark = steady_clock::now();
+        const matrix h18_q = runtime_.run_lower(full.tokens, n, full.tokens.size());
+        const size_t width = static_cast<size_t>(runtime_.n_embd());
+        const float * h18_last = h18_q.data() + h18_q.size() - width;
+
+        std::vector<float> h30_pred;
+        std::vector<float> normalized_pred;
+        lens_->project_and_normalize(h18_last, h30_pred, normalized_pred);
+        const auto lens_all_logits = lens_->score_labels(normalized_pred);
+        early_readout = make_lens_readout(lens_all_logits, lens_->label_token_ids, question_label_ids);
+
+        if (save_as.empty() && lens_->gate.passes(early_readout.label_logits)) {
+            const double inference_ms = elapsed_ms(mark);
+            used_early_readout = true;
+            result.last_residual = std::move(h30_pred);
+            result.last_normalized = std::move(normalized_pred);
+            runtime_.trim_to(parent);
+            result.accounting = {
+                {"parent", parent.id},
+                {"suffix_tokens", suffix},
+                {"block_tokens", {{"lower", suffix}, {"upper", 0}}},
+                {"restore", restored == 0 ? "resident" : "host"},
+                {"restored_bytes", restored},
+                {"restore_ms", restore_ms},
+                {"inference_ms", inference_ms},
+                {"readout_source", "tuned_lens_18"},
+                {"child", json()},
+            };
+            return result;
+        }
+
+        // Gate deferred to block 30 (or caller requested a saved 30 readout child):
+        // zero-recompute suffix handoff feeds already-captured `h18_q` directly
+        // into `upper_` without re-running `lower_`.
+        used_early_readout = false;
+        size_t prefix_upper_tokens = 0;
+        const auto handoff_mark = steady_clock::now();
+        size_t upper_restored = 0;
+        runtime_.ensure_upper_resident(parent, upper_restored, prefix_upper_tokens);
+        if (upper_restored > 0) {
+            restored += upper_restored;
+            restore_ms += elapsed_ms(handoff_mark);
+        }
+        const matrix h30_q = runtime_.run_upper(
+            h18_q, static_cast<llama_pos>(n), result.last_normalized, &result.vocabulary);
+        const double inference_ms = elapsed_ms(mark);
+        result.last_residual.assign(h30_q.end() - static_cast<std::ptrdiff_t>(width), h30_q.end());
+        if (!save_as.empty()) {
+            snapshot child;
+            child.id = save_as;
+            child.completed_blocks = runtime_.n_layer();
+            child.parent = parent.id;
+            child.kind = "readout";
+            child.tokens = full.tokens;
+            child.prompt_sha256 = sha256_hex(full.prompt);
+            child.lower_kv = std::make_shared<const blob>(runtime_.save_state(false));
+            child.upper_kv = std::make_shared<const blob>(runtime_.save_state(true));
+            if (parent.h18) {
+                matrix joined(*parent.h18);
+                joined.insert(joined.end(), h18_q.begin(), h18_q.end());
+                child.h18 = std::make_shared<const matrix>(std::move(joined));
+            }
+            if (parent.h30) {
+                matrix joined(*parent.h30);
+                joined.insert(joined.end(), h30_q.begin(), h30_q.end());
+                child.h30 = std::make_shared<const matrix>(std::move(joined));
+            }
+            child.last_normalized = result.last_normalized;
+            result.child = snapshot_row(child);
+            snapshots_.emplace(save_as, std::move(child));
+        }
+        runtime_.trim_to(parent);
+        result.accounting = {
+            {"parent", parent.id},
+            {"suffix_tokens", suffix},
+            {"block_tokens", {{"lower", suffix}, {"upper", prefix_upper_tokens + suffix}}},
+            {"restore", restored == 0 ? "resident" : "host"},
+            {"restored_bytes", restored},
+            {"restore_ms", restore_ms},
+            {"inference_ms", inference_ms},
+            {"readout_source", "cascade_fallback_30"},
+            {"child", result.child.is_null() ? json() : result.child},
+        };
+        return result;
+    }
+
+    json evaluate(const json & request) {
+        const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
+        const int requested_blocks = request.at("readout_blocks").get<int>();
+        const bool early_mode = !runtime_.full() && requested_blocks == SPLIT_BLOCK;
+        if (early_mode) {
+            if (!lens_) {
+                throw protocol_error("capability_unavailable", "", "No registered early head for that block");
+            }
+            if (parent.completed_blocks != SPLIT_BLOCK && parent.completed_blocks != runtime_.n_layer()) {
+                throw protocol_error("capability_unavailable", "", "Unsupported parent snapshot depth");
+            }
+        } else {
+            if (requested_blocks != runtime_.n_layer()) {
+                throw protocol_error("capability_unavailable", "", "No registered early head for that block");
+            }
+            if (parent.completed_blocks != runtime_.n_layer()) {
+                throw protocol_error("capability_unavailable", "", "Evaluate needs a 30 snapshot; promote first");
+            }
         }
         const auto & rows = request.at("questions");
         if (!rows.is_array() || rows.empty() || rows.size() > 32) throw invalid("internal", "Invalid question count");
@@ -1169,8 +1481,20 @@ private:
         try {
             for (const auto & item : questions) {
                 const auto started = steady_clock::now();
-                auto branch = run_branch(parent, item.full, item.suffix, item.save_as);
-                const readout value = make_readout(branch.vocabulary, item.label_ids, 0);
+                branch_result branch;
+                readout value;
+                if (early_mode) {
+                    bool used_early = false;
+                    branch = run_branch_early(
+                        parent, item.full, item.suffix, item.label_ids, item.save_as, value, used_early);
+                    if (!used_early) {
+                        value = make_readout(branch.vocabulary, item.label_ids, 0);
+                    }
+                } else {
+                    branch = run_branch(parent, item.full, item.suffix, item.save_as);
+                    branch.accounting["readout_source"] = runtime_.full() ? "full" : "final_30";
+                    value = make_readout(branch.vocabulary, item.label_ids, 0);
+                }
                 results.push_back({
                     {"id", item.id},
                     {"label_logits", value.label_logits},
@@ -1204,6 +1528,7 @@ private:
             {"questions", results},
         };
     }
+
 
     json state_eval(const json & request) {
         const snapshot & parent = find(request.at("snapshot_id").get<std::string>());
@@ -1700,6 +2025,7 @@ private:
     const common_chat_templates * templates_;
     std::vector<std::string> labels_;
     std::vector<int> label_ids_;
+    std::unique_ptr<unridden::tuned_lens_model> lens_;
     std::map<std::string, snapshot> snapshots_;
 };
 
@@ -1771,7 +2097,17 @@ int main(int argc, char ** argv) {
         const llama_vocab * vocab = llama_model_get_vocab(model.get());
         auto templates = common_chat_templates_init(model.get(), "");
         auto [labels, token_ids] = validate_alphabet(vocab, templates.get());
-        auto service = std::make_unique<worker>(config, model.get(), templates.get(), labels, token_ids);
+        std::unique_ptr<unridden::tuned_lens_model> lens;
+        if (!config.tuned_lens_path.empty()) {
+            lens = load_tuned_lens(
+                config.tuned_lens_path,
+                config,
+                llama_model_n_embd(model.get()),
+                token_ids);
+        }
+        const std::string early_head = lens ? "tuned-lens-v1" : "none";
+        auto service = std::make_unique<worker>(
+            config, model.get(), templates.get(), labels, token_ids, std::move(lens));
 
         const json hello = {
             {"type", "hello"},
@@ -1794,9 +2130,11 @@ int main(int argc, char ** argv) {
             {"context_prompt_version", CONTEXT_PROMPT_VERSION},
             {"generated_tokens", 0},
             {"rider_mode", true},
+            {"early_head", early_head},
             {"callbacks_enabled", false},
         };
         std::cout << hello.dump() << '\n' << std::flush;
+
 
         std::string line;
         while (read_bounded_line(std::cin, line, MAX_PROTOCOL_BYTES)) {

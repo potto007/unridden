@@ -41,6 +41,7 @@ from unridden.api.snapshots.schema import (
     BlockTokens,
     Persistence,
     Promotion,
+    ReadoutSource,
     RiderRequest,
     RiderResponse,
     RiderTiming,
@@ -84,8 +85,11 @@ def _representation(profile: WorkerHello, kind: str) -> str:
     return "post_final_norm_head_input"
 
 
-def _require_readout(profile: WorkerHello, blocks: int) -> None:
-    if blocks != profile.final_block:
+def _require_readout(
+    profile: WorkerHello, blocks: int, *, allow_early: bool = True
+) -> None:
+    allowed = profile.readout_blocks if allow_early else [profile.final_block]
+    if blocks not in allowed:
         raise CapabilityUnavailable(f"no registered early head for a {blocks} readout")
 
 
@@ -403,18 +407,34 @@ class SnapshotService:
         return promoted.snapshot.snapshot_id, "performed", promoted.timing_ms.total
 
     async def _plan(
-        self, profile: WorkerHello, store: SnapshotStore, ref: SnapshotRef
+        self,
+        profile: WorkerHello,
+        store: SnapshotStore,
+        ref: SnapshotRef,
+        *,
+        readout_blocks: int | None = None,
     ) -> BranchPlan:
         record = store.get(ref.id)
+        early_readout = (
+            readout_blocks is not None
+            and profile.split_block is not None
+            and readout_blocks == profile.split_block
+            and profile.early_head != "none"
+        )
         if ref.relationship == "replace_question":
             if record.boundary != "readout" or record.context_parent is None:
                 raise FollowupUnsupported(
                     "snapshot has no context parent to replace its question"
                 )
             context = store.get(record.context_parent)
-            effective, promotion, promotion_ms = await self._ensure_final(
-                profile, store, context, context.persistence
-            )
+            if early_readout:
+                effective: str = context.id
+                promotion: Promotion = "none"
+                promotion_ms = 0.0
+            else:
+                effective, promotion, promotion_ms = await self._ensure_final(
+                    profile, store, context, context.persistence
+                )
             return BranchPlan(
                 requested_parent=ref.id,
                 effective_parent=effective,
@@ -425,9 +445,14 @@ class SnapshotService:
                 answer_prefix=context.answer_prefix,
                 child_context_parent=effective,
             )
-        effective, promotion, promotion_ms = await self._ensure_final(
-            profile, store, record, record.persistence
-        )
+        if early_readout:
+            effective = record.id
+            promotion = "none"
+            promotion_ms = 0.0
+        else:
+            effective, promotion, promotion_ms = await self._ensure_final(
+                profile, store, record, record.persistence
+            )
         if record.boundary == "context":
             return BranchPlan(
                 requested_parent=ref.id,
@@ -492,7 +517,12 @@ class SnapshotService:
     ) -> V2DecisionResponse:
         async with self._serialized() as (profile, store):
             _require_readout(profile, request.readout.completed_blocks)
-            plan = await self._plan(profile, store, request.snapshot)
+            plan = await self._plan(
+                profile,
+                store,
+                request.snapshot,
+                readout_blocks=request.readout.completed_blocks,
+            )
             compiled: dict[str, CompiledSnapshotQuestion] = {}
             for question_id, question in request.questions.items():
                 if plan.mode == "context":
@@ -521,7 +551,7 @@ class SnapshotService:
                 ]
                 result = await self._backend.evaluate(
                     snapshot_id=plan.effective_parent,
-                    readout_blocks=profile.final_block,
+                    readout_blocks=request.readout.completed_blocks,
                     questions=payloads,
                     timeout=self._request_timeout,
                 )
@@ -532,6 +562,7 @@ class SnapshotService:
                     raise SnapshotProtocolError("worker question count differs")
                 answers: dict[str, Answer] = {}
                 suffix_tokens: dict[str, int] = {}
+                readout_source: dict[str, ReadoutSource] = {}
                 child: dict[str, str] = {}
                 lower = upper = processed = restored = 0
                 restore_ms = inference_ms = 0.0
@@ -544,6 +575,7 @@ class SnapshotService:
                     if raw.snapshot.parent != plan.effective_parent:
                         raise SnapshotProtocolError("branch parent differs")
                     suffix_tokens[question_id] = raw.snapshot.suffix_tokens
+                    readout_source[question_id] = raw.snapshot.readout_source
                     lower += raw.snapshot.block_tokens.lower
                     upper += raw.snapshot.block_tokens.upper
                     processed += raw.processed_tokens
@@ -582,6 +614,7 @@ class SnapshotService:
                     promotion_ms=plan.promotion_ms,
                     inference_ms=inference_ms,
                 ),
+                readout_source=readout_source,
                 child=child or None,
             )
             return V2DecisionResponse(
@@ -597,7 +630,9 @@ class SnapshotService:
         self, request: StateEvaluationRequest, *, owner: str
     ) -> StateEvaluationResponse:
         async with self._serialized() as (profile, store):
-            _require_readout(profile, request.readout.completed_blocks)
+            _require_readout(
+                profile, request.readout.completed_blocks, allow_early=False
+            )
             plan = await self._plan(profile, store, request.snapshot)
             if plan.mode == "context":
                 branch = compile_context_prompt(plan.messages, request.prompt)
@@ -783,8 +818,8 @@ class SnapshotService:
                             else ["continue", "inspect"]
                         ),
                         "generation": False,
-                        "early_head": "none",
-                        "readout_blocks": [profile.final_block],
+                        "early_head": profile.early_head,
+                        "readout_blocks": profile.readout_blocks,
                         "vectors": sorted(_VECTOR_NAMES[profile.profile]),
                     },
                 }

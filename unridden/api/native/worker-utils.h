@@ -91,4 +91,192 @@ inline std::vector<size_t> prefill_chunks(size_t token_count, size_t batch_size)
     return chunks;
 }
 
+inline double logit_margin(const std::vector<double> & logits) {
+    if (logits.size() < 2) throw std::runtime_error("Need at least two label logits");
+    for (const double value : logits) {
+        if (!std::isfinite(value)) throw std::runtime_error("Nonfinite label logit");
+    }
+    std::vector<double> ordered = logits;
+    std::partial_sort(ordered.begin(), ordered.begin() + 2, ordered.end(), std::greater<double>());
+    return std::max(0.0, ordered[0] - ordered[1]);
+}
+
+inline double entropy_concentration(const std::vector<double> & probabilities) {
+    if (probabilities.size() < 2) {
+        throw std::runtime_error("Need at least two label probabilities");
+    }
+    double entropy = 0.0;
+    for (const double item : probabilities) {
+        if (!std::isfinite(item) || item < 0.0 || item > 1.0) {
+            throw std::runtime_error("Invalid label probability");
+        }
+        if (item > 0.0) entropy -= item * std::log(item);
+    }
+    const double scale = std::log(static_cast<double>(probabilities.size()));
+    if (scale <= 0.0) return 1.0;
+    const double normalized = std::min(1.0, std::max(0.0, entropy / scale));
+    return std::min(1.0, std::max(0.0, 1.0 - normalized));
+}
+
+inline std::vector<float> rms_norm(
+        const float * input,
+        const float * weight,
+        size_t n_embd,
+        float eps) {
+    if (n_embd == 0 || !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::runtime_error("Invalid RMSNorm parameters");
+    }
+    double sum_sq = 0.0;
+    for (size_t index = 0; index < n_embd; ++index) {
+        if (!std::isfinite(input[index]) || !std::isfinite(weight[index])) {
+            throw std::runtime_error("Nonfinite RMSNorm input or weight");
+        }
+        const double value = static_cast<double>(input[index]);
+        sum_sq += value * value;
+    }
+    const double scale = 1.0 / std::sqrt(sum_sq / static_cast<double>(n_embd) + static_cast<double>(eps));
+    std::vector<float> output(n_embd);
+    for (size_t index = 0; index < n_embd; ++index) {
+        const float value = static_cast<float>(
+            static_cast<double>(input[index]) * scale * static_cast<double>(weight[index]));
+        if (!std::isfinite(value)) throw std::runtime_error("Nonfinite RMSNorm output");
+        output[index] = value;
+    }
+    return output;
+}
+
+inline double apply_softcap(double logit, double softcap) {
+    if (!std::isfinite(logit) || !std::isfinite(softcap) || softcap < 0.0) {
+        throw std::runtime_error("Invalid softcap parameters");
+    }
+    if (softcap == 0.0) return logit;
+    return softcap * std::tanh(logit / softcap);
+}
+
+struct tuned_lens_gate {
+    bool enabled = true;
+    double min_logit_margin = 0.0;
+    double min_entropy_concentration = 0.0;
+    std::vector<std::pair<size_t, double>> temperatures;
+
+    double temperature_for(size_t option_count) const {
+        for (const auto & [count, temperature] : temperatures) {
+            if (count == option_count) return temperature;
+        }
+        return 1.0;
+    }
+
+    bool passes(const std::vector<double> & label_logits) const {
+        (void) stable_softmax(label_logits);
+        if (!enabled) return true;
+        const double margin = logit_margin(label_logits);
+        const double temperature = temperature_for(label_logits.size());
+        if (!std::isfinite(temperature) || temperature <= 0.0) {
+            throw std::runtime_error("Invalid gate temperature");
+        }
+        std::vector<double> scaled;
+        scaled.reserve(label_logits.size());
+        for (const double value : label_logits) scaled.push_back(value / temperature);
+        const auto probabilities = stable_softmax(scaled);
+        const double concentration = entropy_concentration(probabilities);
+        return margin >= min_logit_margin && concentration >= min_entropy_concentration;
+    }
+};
+
+struct tuned_lens_model {
+    size_t n_embd = 0;
+    float rms_norm_eps = 1e-6f;
+    double logit_softcap = 30.0;
+    std::vector<int> label_token_ids;
+    std::vector<float> weight;
+    std::vector<float> bias;
+    std::vector<float> output_norm;
+    std::vector<float> unembed;
+    tuned_lens_gate gate;
+
+    void validate() const {
+        if (n_embd == 0 || label_token_ids.size() < 2) {
+            throw std::runtime_error("Invalid Tuned Lens dimensions");
+        }
+        if (!std::isfinite(rms_norm_eps) || rms_norm_eps <= 0.0f) {
+            throw std::runtime_error("Invalid Tuned Lens rms_norm_eps");
+        }
+        if (!std::isfinite(logit_softcap) || logit_softcap < 0.0) {
+            throw std::runtime_error("Invalid Tuned Lens logit_softcap");
+        }
+        if (weight.size() != n_embd * n_embd ||
+                bias.size() != n_embd ||
+                output_norm.size() != n_embd ||
+                unembed.size() != label_token_ids.size() * n_embd) {
+            throw std::runtime_error("Tuned Lens tensor size mismatch");
+        }
+        for (const float value : weight) {
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Tuned Lens weight");
+        }
+        for (const float value : bias) {
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Tuned Lens bias");
+        }
+        for (const float value : output_norm) {
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Tuned Lens output_norm");
+        }
+        for (const float value : unembed) {
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Tuned Lens unembed");
+        }
+        if (!std::isfinite(gate.min_logit_margin) || gate.min_logit_margin < 0.0 ||
+                !std::isfinite(gate.min_entropy_concentration) ||
+                gate.min_entropy_concentration < 0.0 ||
+                gate.min_entropy_concentration > 1.0) {
+            throw std::runtime_error("Invalid Tuned Lens gate thresholds");
+        }
+        for (const auto & [count, temperature] : gate.temperatures) {
+            if (count < 2 || !std::isfinite(temperature) || temperature <= 0.0) {
+                throw std::runtime_error("Invalid Tuned Lens gate temperature");
+            }
+        }
+    }
+
+    void project_and_normalize(
+            const float * h18_last,
+            std::vector<float> & h30_pred,
+            std::vector<float> & normalized) const {
+        if (!h18_last) throw std::runtime_error("Missing H18 input");
+        for (size_t index = 0; index < n_embd; ++index) {
+            if (!std::isfinite(h18_last[index])) {
+                throw std::runtime_error("Nonfinite H18 input");
+            }
+        }
+        h30_pred.resize(n_embd);
+        for (size_t row = 0; row < n_embd; ++row) {
+            double accum = static_cast<double>(bias[row]);
+            const float * weight_row = weight.data() + row * n_embd;
+            for (size_t col = 0; col < n_embd; ++col) {
+                accum += static_cast<double>(weight_row[col]) * static_cast<double>(h18_last[col]);
+            }
+            const float projected = static_cast<float>(accum);
+            if (!std::isfinite(projected)) {
+                throw std::runtime_error("Nonfinite Tuned Lens projection");
+            }
+            h30_pred[row] = projected;
+        }
+        normalized = rms_norm(h30_pred.data(), output_norm.data(), n_embd, rms_norm_eps);
+    }
+
+    std::vector<double> score_labels(const std::vector<float> & normalized) const {
+        if (normalized.size() != n_embd) {
+            throw std::runtime_error("Normalized vector width mismatch");
+        }
+        const size_t label_count = label_token_ids.size();
+        std::vector<double> logits(label_count);
+        for (size_t label = 0; label < label_count; ++label) {
+            double dot = 0.0;
+            const float * row = unembed.data() + label * n_embd;
+            for (size_t col = 0; col < n_embd; ++col) {
+                dot += static_cast<double>(row[col]) * static_cast<double>(normalized[col]);
+            }
+            logits[label] = apply_softcap(dot, logit_softcap);
+        }
+        return logits;
+    }
+};
+
 }  // namespace unridden

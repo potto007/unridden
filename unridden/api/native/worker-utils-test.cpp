@@ -56,5 +56,42 @@ int main() {
         }
         check(rejected);
     }
+    {
+        const std::vector<float> h{3.0f, 4.0f};
+        const std::vector<float> gamma{2.0f, 0.5f};
+        const auto normed = unridden::rms_norm(h.data(), gamma.data(), 2, 1e-6f);
+        const double inv_rms = 1.0 / std::sqrt((9.0 + 16.0) / 2.0 + 1e-6);
+        check(close(normed.at(0), 3.0 * inv_rms * 2.0, 1e-6));
+        check(close(normed.at(1), 4.0 * inv_rms * 0.5, 1e-6));
+        check(close(unridden::apply_softcap(0.0, 30.0), 0.0));
+        check(close(unridden::apply_softcap(30.0, 30.0), 30.0 * std::tanh(1.0)));
+    }
+    {
+        unridden::tuned_lens_model lens;
+        lens.n_embd = 2;
+        lens.rms_norm_eps = 1e-6f;
+        lens.logit_softcap = 0.0;
+        lens.label_token_ids = {10, 11, 12};
+        lens.weight = {1.0f, 0.0f, 0.0f, 1.0f};
+        lens.bias = {0.0f, 0.0f};
+        lens.output_norm = {1.0f, 1.0f};
+        lens.unembed = {2.0f, 0.0f, 0.0f, 2.0f, -1.0f, -1.0f};
+        lens.gate.min_logit_margin = 0.4;
+        lens.gate.min_entropy_concentration = 0.1;
+        lens.gate.temperatures = {{2, 1.0}};
+        lens.validate();
+
+        const std::vector<float> h18{4.0f, 0.0f};
+        std::vector<float> h30_pred;
+        std::vector<float> normalized;
+        lens.project_and_normalize(h18.data(), h30_pred, normalized);
+        const auto logits = lens.score_labels(normalized);
+        check(logits.size() == 3);
+        check(logits.at(0) > logits.at(1));
+        check(logits.at(1) > logits.at(2));
+
+        check(lens.gate.passes({logits.at(0), logits.at(1)}));
+        check(!lens.gate.passes({1.0, 0.99}));
+    }
     return 0;
 }

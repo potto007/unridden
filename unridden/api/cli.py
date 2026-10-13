@@ -154,6 +154,12 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         default=defaults.snapshot_profile,
         help="full-v1 serves any Gemma 4 with one whole-model checkpoint",
     )
+    parser.add_argument(
+        "--snapshot-tuned-lens",
+        type=Path,
+        default=defaults.snapshot_tuned_lens_path,
+        help="optional validated tuned-lens-v1 artifact for block-18 readout",
+    )
 
 
 def _config(args: argparse.Namespace) -> ApiConfig:
@@ -180,6 +186,7 @@ def _config(args: argparse.Namespace) -> ApiConfig:
         snapshot_default_ttl=args.snapshot_ttl,
         snapshot_reference=args.snapshot_reference,
         snapshot_profile=args.snapshot_profile,
+        snapshot_tuned_lens_path=args.snapshot_tuned_lens,
     )
 
 

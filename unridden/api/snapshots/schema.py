@@ -44,6 +44,13 @@ type Relationship = Literal["followup", "replace_question"]
 type Boundary = Literal["context", "readout"]
 type Capability = Literal["continue", "promote", "inspect"]
 type Promotion = Literal["performed", "reused", "none"]
+type EarlyHeadName = Literal["none", "tuned-lens-v1"]
+type ReadoutSource = Literal[
+    "final_30",
+    "full",
+    "tuned_lens_18",
+    "cascade_fallback_30",
+]
 type ExportKind = Literal["last_residual", "last_normalized", "top_logits"]
 # How the exported vector was produced, so a caller never mistakes a raw
 # residual for a post-norm head input (design "capture integrity"). The
@@ -212,6 +219,9 @@ class SnapshotUsage(StrictModel):
     reused_prefix_tokens: int = Field(ge=0)
     restored_bytes: int = Field(ge=0)
     timing: SnapshotTiming
+    # Per question, the readout source (`final_30`, `full`, `tuned_lens_18`,
+    # or `cascade_fallback_30`).
+    readout_source: dict[str, ReadoutSource] | None = None
     # Per question, the child snapshot id when `save_result_snapshot` was set.
     child: dict[str, str] | None = None
 
@@ -493,12 +503,15 @@ class WorkerSnapshotBranch(StrictModel):
     restored_bytes: int = Field(ge=0)
     restore_ms: float = Field(ge=0.0)
     inference_ms: float = Field(ge=0.0)
+    readout_source: ReadoutSource = "final_30"
     child: WorkerSnapshotRow | None = None
 
     @model_validator(mode="after")
     def _restore_accounting(self) -> Self:
         if self.restore == "resident" and self.restored_bytes != 0:
             raise ValueError("a resident branch restored no bytes")
+        if self.readout_source == "tuned_lens_18" and self.block_tokens.upper != 0:
+            raise ValueError("an early tuned-lens readout cannot run upper blocks")
         if (
             self.child is not None
             and self.child.completed_blocks == PROFILE_SPLIT_BLOCK
@@ -720,6 +733,7 @@ class WorkerHello(StrictModel):
     generated_tokens: Literal[0]
     # A worker built with the `ride` command; older workers omit it.
     rider_mode: bool = False
+    early_head: EarlyHeadName = "none"
     callbacks_enabled: Literal[False]
 
     @model_validator(mode="after")
@@ -744,6 +758,8 @@ class WorkerHello(StrictModel):
             raise ValueError("full-v1 has no split block")
         if self.profile == FULL_PROFILE and self.reference_context:
             raise ValueError("full-v1 has no reference context")
+        if self.profile == FULL_PROFILE and self.early_head != "none":
+            raise ValueError("full-v1 has no early head")
         return self
 
     @property
@@ -756,6 +772,13 @@ class WorkerHello(StrictModel):
         if self.split_block is None:
             return [self.n_layer]
         return [self.split_block, self.n_layer]
+
+    @property
+    def readout_blocks(self) -> list[int]:
+        """The block boundaries this worker can evaluate decisions at."""
+        if self.split_block is not None and self.early_head != "none":
+            return [self.split_block, self.n_layer]
+        return [self.n_layer]
 
     @property
     def execution_mode(self) -> Literal["split18-30", "full"]:
@@ -809,12 +832,14 @@ __all__ = [
     "ContextInput",
     "CreateUsage",
     "DecisionInput",
+    "EarlyHeadName",
     "ExportKind",
     "Persistence",
     "Promotion",
     "ProfileName",
     "PromptInput",
     "Readout",
+    "ReadoutSource",
     "Relationship",
     "Representation",
     "SnapshotBytes",
