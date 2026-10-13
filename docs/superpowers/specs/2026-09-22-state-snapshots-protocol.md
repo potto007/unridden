@@ -50,8 +50,13 @@ Errors: `{"type":"error","id":...,"code":C,"reason":R,"message":M}`.
  "context_size":2048,"batch_size":256,"ubatch_size":256,"threads":8,
  "n_layer":30,"n_embd":2816,"split_block":18,"reference_context":false,
  "context_prompt_version":"unridden-gemma-context-v1",
- "generated_tokens":0,"callbacks_enabled":false}
+ "generated_tokens":0,"rider_mode":true,"steering_mode":true,
+ "callbacks_enabled":false}
 ```
+
+`steering_mode` is true only for the split profile; workers built before
+ADR 0011 omit it. A caller must never send `steering` to a worker that did
+not advertise it.
 
 ## Prompt profile `unridden-gemma-context-v1`
 
@@ -145,6 +150,27 @@ finishes `P` through blocks 19-30 from the stored `H18[P]` (same chunking as
 `create`). Response `{"type":"promoted","id","snapshot":{...as above, parent =
 the 18 id},"block_tokens":{"lower":0,"upper":N},"timing_ms":{...}}`.
 `capability_unavailable` for a 30 snapshot. Memoization is the caller's job.
+
+`promote`, `evaluate` and `state_eval` accept an optional `steering` object
+(ADR 0011), absent or null for none:
+
+```json
+"steering":{"alpha":0.5,"scope":"all"|"last",
+            "vector":{"dtype":"f32","byte_order":"little","shape":[2816],
+                      "base64":"..."}}
+```
+
+Before the upper range runs, the worker adds `alpha * vector` to the H18 rows
+it is about to continue: in `promote`, a copy of the parent's `H18[P]`; in a
+branch, the branch's own suffix rows `H18[Q]`. `scope` selects every such row
+or only the final one. The parent snapshot's stored H18 is never mutated. A
+child saved by a steered branch stores the steered suffix rows, so its H18 is
+what its upper K/V and H30 were computed from. The width must equal `n_embd`,
+all values must be finite and the direction must not be all zeros, else
+`invalid_request`. `capability_unavailable` in profile `full-v1`, which has
+no host-side H18 boundary. A caller that memoizes promotion must promote
+unsteered; a steered promotion is a different snapshot, not the canonical
+continuation.
 
 ### `evaluate` (typed questions)
 

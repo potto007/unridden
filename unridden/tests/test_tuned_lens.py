@@ -388,6 +388,7 @@ class TunedLensFakeSnapshotBackend(FakeSnapshotBackend):
         snapshot_id: str,
         readout_blocks: int,
         questions: list[dict[str, Any]],
+        steering: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> WorkerResult:
         if readout_blocks == 30:
@@ -395,8 +396,10 @@ class TunedLensFakeSnapshotBackend(FakeSnapshotBackend):
                 snapshot_id=snapshot_id,
                 readout_blocks=readout_blocks,
                 questions=questions,
+                steering=steering,
                 timeout=timeout,
             )
+        self.steering_seen.append(steering)
         assert readout_blocks == 18
         reused = self._snaps[snapshot_id]["tokens"]
         rows: list[WorkerSnapshotQuestionResult] = []
