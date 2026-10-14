@@ -24,7 +24,7 @@ Unridden is a local, non-generative structured decision API backed by owned `lla
 
 ## 3. Uncertainty, Calibration, and Escalation Gate (`unridden/api/gate.py`)
 
-- **Preserve `confidence_formula`:** `ChoiceAnswer.confidence` and `ScoreAnswer.confidence` are pinned on the wire as `max_probability_v1` (`max(probabilities)`). Additive uncertainty signals (`logit_margin`, `probability_margin`, `normalized_entropy`) belong on `QuestionDiagnostics` and in `unridden/api/gate.py`.
+- **Preserve `confidence_formula`:** `ChoiceAnswer.confidence` and `ScoreAnswer.confidence` are pinned on the wire as `max_probability_v1` (`max(probabilities)`). Additive uncertainty signals (`logit_margin`, `probability_margin`, `normalized_entropy`) belong on `QuestionDiagnostics` and in `unridden/api/gate.py`. The served calibration (`QuestionDiagnostics.calibration` and `.gate`, ADR 0012) is diagnostics-only, present only when `--calibration-table` is loaded, and bound at startup to `model_sha256`, `runtime_sha256` and the compiler `PROMPT_VERSION`; a mismatched or provenance-less table must refuse to start. `?probe=true` may re-ask a question with reversed options but must never replace the primary answer, and its tokens count in `usage.input_tokens` with `output_tokens` still 0.
 - **Temperature Calibration Discipline:**
   - Fit temperatures per `(question_type, option_count)` bucket (`fit_temperature_table`), never as a single global scalar across incompatible option cardinalities.
   - Clamp fitted temperatures into `[1.0, 5.0]` by default (with warning on clamped or sparse `< 10` sample buckets) and bind tables to `model_sha256`, `runtime_sha256`, and `prompt_version`.

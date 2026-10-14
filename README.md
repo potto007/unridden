@@ -342,7 +342,9 @@ Routes: `POST /v1/decisions`, `GET /v1/models`, `GET /health`, plus FastAPI's
 (raw label logits, token mapping, allowed-label coverage, full-vocabulary
 argmax, prompt hash and version, prompt/processed/reused token counts, timing,
 model and runtime hashes, and the `generated_tokens: 0` and
-`callbacks_enabled: false` invariants). `GET /v1/models` reports the live limits
+`callbacks_enabled: false` invariants, and, when a calibration table is loaded,
+the calibrated readout and gate verdict; `?probe=true` adds an option-reversed
+re-ask of borderline questions). `GET /v1/models` reports the live limits
 and capabilities. A copy of the validated schema is at
 [docs/openapi.json](docs/openapi.json). `POST /v1/systemone` is a compatibility
 alias that behaves identically to `POST /v1/decisions`, offered as an
@@ -384,7 +386,11 @@ Read these before trusting an answer.
   label's conditional probability. Across the 1,286 use-case questions of the
   first frozen run, 94.7% of answers exceed 0.99, the mean is 0.995 when right
   and 0.945 when wrong, and only 18 answers fall below 0.8. It must not gate
-  decisions without task-specific calibration.
+  decisions without task-specific calibration. A server started with
+  `--calibration-table` adds a temperature-scaled readout and an escalation
+  gate verdict to `?diagnostics=true` ([ADR 0012](docs/decisions/0012-calibrated-confidence-on-the-wire.md));
+  the table is fitted per model, runtime and prompt version, and a freshly
+  fitted one says `fitted_requires_held_out_validation` on every answer.
 - **Probabilities are conditional on the options you supplied.** High coverage of
   the full-vocabulary mass does not certify a correct answer.
 - **Deterministic per configuration, not across configurations.** With a fixed

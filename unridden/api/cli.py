@@ -53,14 +53,19 @@ async def evaluate_requests(
     *,
     backend_factory: BackendFactory | None = None,
     diagnostics: bool = False,
+    probe: bool = False,
 ) -> list[DecisionResponse]:
+    if probe and not diagnostics:
+        raise ValueError("--probe requires --diagnostics")
     factory = backend_factory or _default_backend
     service = ApiService(factory(config), config)
     responses: list[DecisionResponse] = []
     try:
         await service.start()
         for request in requests:
-            responses.append(await service.evaluate(request, diagnostics=diagnostics))
+            responses.append(
+                await service.evaluate(request, diagnostics=diagnostics, probe=probe)
+            )
         return responses
     finally:
         await service.close()
@@ -160,6 +165,22 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         default=defaults.snapshot_tuned_lens_path,
         help="optional validated tuned-lens-v1 artifact for block-18 readout",
     )
+    parser.add_argument(
+        "--calibration-table",
+        type=Path,
+        default=defaults.calibration_table_path,
+        help=(
+            "fitted TemperatureCalibrationTable JSON bound to this model, runtime "
+            "and prompt version; adds calibrated confidence and the escalation "
+            "gate to ?diagnostics=true (ADR 0012)"
+        ),
+    )
+    parser.add_argument(
+        "--gate-config",
+        type=Path,
+        default=defaults.gate_config_path,
+        help="EscalationGateConfig JSON overriding the gate thresholds",
+    )
 
 
 def _config(args: argparse.Namespace) -> ApiConfig:
@@ -187,6 +208,8 @@ def _config(args: argparse.Namespace) -> ApiConfig:
         snapshot_reference=args.snapshot_reference,
         snapshot_profile=args.snapshot_profile,
         snapshot_tuned_lens_path=args.snapshot_tuned_lens,
+        calibration_table_path=args.calibration_table,
+        gate_config_path=args.gate_config,
     )
 
 
@@ -198,6 +221,12 @@ def main() -> None:
     run.add_argument("--input", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--diagnostics", action="store_true")
+    run.add_argument(
+        "--probe",
+        action="store_true",
+        help="re-ask borderline questions with reversed options (needs "
+        "--diagnostics and --calibration-table)",
+    )
     serve = commands.add_parser("serve", help="serve the ASGI application")
     _add_runtime_arguments(serve)
     serve.add_argument("--host", default="127.0.0.1")
@@ -237,6 +266,7 @@ def main() -> None:
                 requests,
                 config,
                 diagnostics=args.diagnostics,
+                probe=args.probe,
             )
         )
         write_responses(args.output, responses)
