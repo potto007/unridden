@@ -35,8 +35,11 @@ from unridden.api.mapping import (
 )
 from unridden.api.schema import (
     Answer,
+    CalibrationStatus,
     ChoiceAnswer,
     ChoiceQuestion,
+    GateAction,
+    GateReason,
     NoulAnswer,
     NoulQuestion,
     Question,
@@ -46,17 +49,6 @@ from unridden.api.schema import (
 )
 
 type QuestionKind = Literal["choice", "score", "noul"]
-type GateAction = Literal["accept_primary", "run_permutation_probe", "escalate"]
-type GateReason = Literal[
-    "high_calibrated_margin",
-    "borderline_margin",
-    "low_calibrated_margin",
-    "low_coverage",
-    "permutation_flip",
-    "permutation_tvd",
-    "low_post_probe_margin",
-    "permutation_stable",
-]
 
 
 def bucket_key(question_type: QuestionKind, option_count: int) -> str:
@@ -113,9 +105,7 @@ class BucketCalibration(StrictModel):
 class TemperatureCalibrationTable(StrictModel):
     """Per-bucket temperature table bound to model/runtime/prompt provenance."""
 
-    status: Literal["fitted_requires_held_out_validation", "validated_on_held_out"] = (
-        "fitted_requires_held_out_validation"
-    )
+    status: CalibrationStatus = "fitted_requires_held_out_validation"
     model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     runtime_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     prompt_version: str | None = None

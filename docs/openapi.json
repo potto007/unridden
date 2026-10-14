@@ -55,6 +55,16 @@
               "default": false,
               "title": "Diagnostics"
             }
+          },
+          {
+            "name": "probe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Probe"
+            }
           }
         ],
         "requestBody": {
@@ -105,6 +115,16 @@
               "default": false,
               "title": "Diagnostics"
             }
+          },
+          {
+            "name": "probe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Probe"
+            }
           }
         ],
         "requestBody": {
@@ -147,6 +167,88 @@
       "BatchedFallback": {
         "type": "string",
         "const": "context"
+      },
+      "CalibrationDiagnostics": {
+        "properties": {
+          "confidence_formula": {
+            "type": "string",
+            "const": "temperature_scaled_max_probability_v1",
+            "title": "Confidence Formula",
+            "default": "temperature_scaled_max_probability_v1"
+          },
+          "table_status": {
+            "type": "string",
+            "enum": [
+              "fitted_requires_held_out_validation",
+              "validated_on_held_out"
+            ],
+            "title": "Table Status"
+          },
+          "bucket": {
+            "type": "string",
+            "title": "Bucket"
+          },
+          "temperature": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.5,
+            "title": "Temperature"
+          },
+          "temperature_source": {
+            "type": "string",
+            "enum": [
+              "bucket",
+              "type_fallback",
+              "default"
+            ],
+            "title": "Temperature Source"
+          },
+          "calibrated_probabilities": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Calibrated Probabilities"
+          },
+          "calibrated_confidence": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Calibrated Confidence"
+          },
+          "calibrated_probability_margin": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Calibrated Probability Margin"
+          },
+          "scaled_logit_margin": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Scaled Logit Margin"
+          },
+          "calibrated_normalized_entropy": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Calibrated Normalized Entropy"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "table_status",
+          "bucket",
+          "temperature",
+          "temperature_source",
+          "calibrated_probabilities",
+          "calibrated_confidence",
+          "calibrated_probability_margin",
+          "scaled_logit_margin",
+          "calibrated_normalized_entropy"
+        ],
+        "title": "CalibrationDiagnostics",
+        "description": "Temperature-scaled readout of one question (ADR 0012).\n\nAdditive to the pinned `confidence` (`max_probability_v1`): the public\nanswer is unchanged and this block says what the same logits look like\nunder the operator's fitted per-bucket temperature."
       },
       "ChoiceAnswer": {
         "properties": {
@@ -399,6 +501,51 @@
         ],
         "title": "FullVocabularyArgmax"
       },
+      "GateDiagnostics": {
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "accept_primary",
+              "run_permutation_probe",
+              "escalate"
+            ],
+            "title": "Action"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "high_calibrated_margin",
+              "borderline_margin",
+              "low_calibrated_margin",
+              "low_coverage",
+              "permutation_flip",
+              "permutation_tvd",
+              "low_post_probe_margin",
+              "permutation_stable"
+            ],
+            "title": "Reason"
+          },
+          "probe": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PermutationProbeDiagnostics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "action",
+          "reason"
+        ],
+        "title": "GateDiagnostics",
+        "description": "Escalation gate verdict for one question (`unridden.api.gate`)."
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -537,6 +684,80 @@
         ],
         "title": "NoulQuestion"
       },
+      "PermutationProbeDiagnostics": {
+        "properties": {
+          "flipped": {
+            "type": "boolean",
+            "title": "Flipped"
+          },
+          "permuted_top1": {
+            "type": "string",
+            "title": "Permuted Top1"
+          },
+          "max_probability_delta": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Max Probability Delta"
+          },
+          "total_variation_distance": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Total Variation Distance"
+          },
+          "post_probe_margin": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Post Probe Margin"
+          },
+          "post_probe_entropy": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Post Probe Entropy"
+          },
+          "realigned_probabilities": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Realigned Probabilities"
+          },
+          "prompt_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Prompt Sha256"
+          },
+          "processed_tokens": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Processed Tokens"
+          },
+          "generated_tokens": {
+            "type": "integer",
+            "const": 0,
+            "title": "Generated Tokens",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "flipped",
+          "permuted_top1",
+          "max_probability_delta",
+          "total_variation_distance",
+          "post_probe_margin",
+          "post_probe_entropy",
+          "realigned_probabilities",
+          "prompt_sha256",
+          "processed_tokens"
+        ],
+        "title": "PermutationProbeDiagnostics",
+        "description": "The option-reversed re-ask of one question, realigned to its order."
+      },
       "QuestionDiagnostics": {
         "properties": {
           "raw_label_logits": {
@@ -545,6 +766,23 @@
             },
             "type": "array",
             "title": "Raw Label Logits"
+          },
+          "logit_margin": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Logit Margin"
+          },
+          "probability_margin": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Probability Margin"
+          },
+          "normalized_entropy": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Normalized Entropy"
           },
           "token_mapping": {
             "additionalProperties": {
@@ -640,12 +878,35 @@
             "type": "boolean",
             "const": false,
             "title": "Callbacks Enabled"
+          },
+          "calibration": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CalibrationDiagnostics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GateDiagnostics"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
           "raw_label_logits",
+          "logit_margin",
+          "probability_margin",
+          "normalized_entropy",
           "token_mapping",
           "coverage",
           "full_vocabulary_argmax",

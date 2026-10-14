@@ -167,6 +167,50 @@ contains `raw_label_logits`, `token_mapping`, `coverage`,
 `timing_ms`, `model_sha256`, `runtime_sha256`, `execution_mode`,
 `generated_tokens`, and `callbacks_enabled`.
 
+### Calibrated confidence and the escalation gate
+
+`confidence` is the raw `max_probability_v1` and stays that way. When the
+server is started with `--calibration-table table.json` (ADR 0012), each
+diagnostics entry also carries:
+
+- `calibration`: `temperature` and `temperature_source` (`bucket`,
+  `type_fallback` or `default`), the `bucket` (`choice:2`, `score:5`,
+  `noul:2`), `calibrated_probabilities` keyed like the answer,
+  `calibrated_confidence`, `calibrated_probability_margin`,
+  `scaled_logit_margin`, `calibrated_normalized_entropy`, and the table's
+  `table_status` (`fitted_requires_held_out_validation` or
+  `validated_on_held_out`).
+- `gate`: `action` (`accept_primary`, `run_permutation_probe`, `escalate`)
+  and `reason` from the calibrated-margin policy in `unridden.api.gate`.
+
+Add `?probe=true` (with `?diagnostics=true`) and the service re-asks every
+question whose action is `run_permutation_probe` with its options reversed,
+against the same state and under the same zero-generation contract. The
+verdict then rests on both passes and `gate.probe` reports `flipped`,
+`permuted_top1`, `total_variation_distance`, `post_probe_margin`, the
+realigned probabilities, and the probe's `prompt_sha256` and
+`processed_tokens`. Probe tokens are counted in `usage.input_tokens`. The
+primary answers are never replaced by the probe.
+
+The table binds to `model_sha256`, `runtime_sha256` and the compiler's
+prompt version; startup refuses a table fitted on anything else, and
+`GET /v1/models` reports the loaded binding under `calibration`. Fit one from
+a `run_usecase_suites.py --diagnostics` run:
+
+```bash
+python scripts/unridden/fit_calibration_table.py \
+  --observations outputs/suites/<run>/observations.jsonl \
+  --out models/calibration/<model>.json
+python -m unridden.api.cli serve ... --calibration-table models/calibration/<model>.json
+```
+
+The fitter writes `status: fitted_requires_held_out_validation`; run
+`scripts/unridden/evaluate_escalation_gate.py` for the held-out numbers. The
+gate thresholds default to `high_margin_threshold: 0.60`,
+`low_margin_threshold: 0.20`, `min_coverage: 0.10`, `max_tvd_threshold: 0.25`
+and `post_probe_margin_threshold: 0.35`; `--gate-config thresholds.json`
+overrides any of them.
+
 Native stderr is never copied into HTTP errors. Operators can enable the
 `unridden.api.native` logger at DEBUG or inspect the bounded
 `app.state.service.backend.stderr_tail`. The exact owned child is available as

@@ -22,7 +22,8 @@ from unridden.api.backend import (
     BackendRequestError,
     BackendUnavailableError,
 )
-from unridden.api.compiler import compile_request
+from unridden.api.calibration import Calibration, CalibrationError
+from unridden.api.compiler import PROMPT_VERSION, compile_request
 from unridden.api.mapping import map_response
 from unridden.api.schema import (
     MODEL_ID,
@@ -120,6 +121,13 @@ class ApiConfig:
     # Gemma 4, one whole-model checkpoint; ADR 0009).
     snapshot_profile: Literal["split18-30-v1", "full-v1"] = "split18-30-v1"
     snapshot_tuned_lens_path: Path | None = None
+    # Optional fitted temperature table (ADR 0012). Startup refuses a table
+    # whose model, runtime or prompt version differ from the live backend.
+    # With it loaded, `?diagnostics=true` adds the calibrated readout and the
+    # escalation gate verdict, and `?probe=true` may re-ask borderline
+    # questions with reversed options. `confidence` itself never changes.
+    calibration_table_path: Path | None = None
+    gate_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         positive = {
@@ -150,6 +158,8 @@ class ApiConfig:
             raise ValueError("timeouts must be positive")
         if not self.v1_enabled and not self.snapshots_enabled:
             raise ValueError("at least one of v1 or snapshots must be enabled")
+        if self.gate_config_path is not None and self.calibration_table_path is None:
+            raise ValueError("gate_config_path needs calibration_table_path")
         if self.snapshots_enabled:
             if self.snapshot_host_bytes <= 0:
                 raise ValueError("snapshot_host_bytes must be positive")
@@ -161,11 +171,22 @@ class BusyError(RuntimeError):
     """The one-request backend is occupied."""
 
 
+class ProbeUnavailableError(ValueError):
+    """`?probe=true` was asked of a server without a calibration table."""
+
+
 class ApiService:
     def __init__(self, backend: Backend, config: ApiConfig) -> None:
         self.backend = backend
         self.config = config
         self.profile: BackendProfile | None = None
+        # Loaded before the model so a bad file fails without touching the GPU;
+        # bound to the handshake in `start`.
+        self.calibration: Calibration | None = (
+            Calibration.load(config.calibration_table_path, config.gate_config_path)
+            if config.calibration_table_path is not None
+            else None
+        )
         self._guard = asyncio.Lock()
         self._busy = False
 
@@ -173,39 +194,83 @@ class ApiService:
         self.profile = await asyncio.wait_for(
             self.backend.start(), timeout=self.config.startup_timeout
         )
+        if self.calibration is not None:
+            try:
+                self.calibration.bind(self.profile, prompt_version=PROMPT_VERSION)
+            except CalibrationError:
+                await self.backend.close()
+                raise
 
     async def close(self) -> None:
         await self.backend.close()
 
     async def evaluate(
-        self, request: DecisionRequest, *, diagnostics: bool
+        self,
+        request: DecisionRequest,
+        *,
+        diagnostics: bool,
+        probe: bool = False,
     ) -> DecisionResponse:
         if self.profile is None or not self.backend.ready:
             raise BackendUnavailableError("backend unavailable")
+        if probe and self.calibration is None:
+            raise ProbeUnavailableError("no calibration table is loaded")
         async with self._guard:
             if self._busy:
                 raise BusyError("backend busy")
             self._busy = True
         try:
-            batch = compile_request(
-                request, self.profile, share_prefix=self.config.share_prefix
+            response = await self._evaluate_once(
+                request, include_diagnostics=diagnostics
             )
-            worker = await asyncio.wait_for(
-                self.backend.evaluate(batch, timeout=self.config.request_timeout),
-                timeout=self.config.request_timeout,
+            if self.calibration is None or not diagnostics:
+                return response
+            decisions = self.calibration.stage1(request, response)
+            probe_response: DecisionResponse | None = None
+            probe_request = (
+                self.calibration.probe_request(request, decisions) if probe else None
             )
+            if probe_request is not None:
+                # One more owned pass over the same state with the options
+                # reversed: same non-generation contract, same busy slot.
+                probe_response = await self._evaluate_once(
+                    probe_request, include_diagnostics=True
+                )
+                decisions = self.calibration.stage2(
+                    request, response, decisions, probe_request, probe_response
+                )
             try:
-                return map_response(
-                    batch, worker, self.profile, include_diagnostics=diagnostics
+                return self.calibration.annotate(
+                    request, response, decisions, probe_response
                 )
             except ValueError as error:
-                await self.backend.close()
                 raise BackendProtocolError(
-                    "backend response differs from the request"
+                    "calibration could not be applied to the response"
                 ) from error
         finally:
             async with self._guard:
                 self._busy = False
+
+    async def _evaluate_once(
+        self, request: DecisionRequest, *, include_diagnostics: bool
+    ) -> DecisionResponse:
+        assert self.profile is not None
+        batch = compile_request(
+            request, self.profile, share_prefix=self.config.share_prefix
+        )
+        worker = await asyncio.wait_for(
+            self.backend.evaluate(batch, timeout=self.config.request_timeout),
+            timeout=self.config.request_timeout,
+        )
+        try:
+            return map_response(
+                batch, worker, self.profile, include_diagnostics=include_diagnostics
+            )
+        except ValueError as error:
+            await self.backend.close()
+            raise BackendProtocolError(
+                "backend response differs from the request"
+            ) from error
 
 
 def _error(
@@ -439,6 +504,8 @@ def create_app(
         profile = service.profile if service is not None else None
         if profile is None:
             return {"models": []}
+        calibration = service.calibration if service is not None else None
+        binding = calibration.binding if calibration is not None else None
         return {
             "models": [
                 {
@@ -459,7 +526,19 @@ def create_app(
                         "confidence": "max_probability_v1",
                         "score": "zero_based_expected_value",
                         "probabilities": ("conditional_on_allowed_single_token_labels"),
+                        # Diagnostics-only and additive (ADR 0012). None until
+                        # an operator loads a table bound to this backend.
+                        "calibrated_confidence": (
+                            "temperature_scaled_max_probability_v1"
+                            if binding is not None
+                            else None
+                        ),
+                        "escalation_gate": binding is not None,
+                        "permutation_probe": binding is not None,
                     },
+                    "calibration": (
+                        binding.model_dump() if binding is not None else None
+                    ),
                     "runtime": {
                         "context": profile.context_size,
                         "batch": profile.batch_size,
@@ -482,16 +561,31 @@ def create_app(
         request: DecisionRequest,
         raw_request: Request,
         diagnostics: bool = Query(default=False),
+        probe: bool = Query(default=False),
     ) -> DecisionResponse | JSONResponse:
         if request.model != MODEL_ID:
             return _error(404, "unknown_model", "requested model is not available")
+        if probe and not diagnostics:
+            return _error(
+                422,
+                "invalid_request",
+                "probe=true requires diagnostics=true",
+                field="probe",
+            )
         service: ApiService | None = raw_request.app.state.service
         if service is None:
             return _error(
                 529, "unavailable", "model backend is unavailable", retryable=True
             )
         try:
-            return await service.evaluate(request, diagnostics=diagnostics)
+            return await service.evaluate(request, diagnostics=diagnostics, probe=probe)
+        except ProbeUnavailableError:
+            return _error(
+                422,
+                "capability_unavailable",
+                "probe=true needs a calibration table loaded on the server",
+                field="probe",
+            )
         except BusyError:
             return _error(
                 429,

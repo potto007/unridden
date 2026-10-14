@@ -13,6 +13,25 @@ published measurements were taken on.
 
 ### Added
 
+- Calibrated confidence and the escalation gate on the wire (ADR 0012).
+  `unridden-api serve --calibration-table table.json` loads a per-bucket
+  temperature table and refuses to start unless its `model_sha256`,
+  `runtime_sha256` and `prompt_version` match the live backend. With it
+  loaded, each `?diagnostics=true` entry gains `calibration` (the
+  temperature-scaled probabilities, confidence, margin and entropy, the
+  bucket and temperature used, and the table's validation status) and
+  `gate` (`accept_primary`, `run_permutation_probe` or `escalate`, with the
+  reason). `?probe=true` re-asks borderline Choice and Score questions with
+  their options reversed and reports the realigned result under
+  `gate.probe`; the probe's tokens join `usage.input_tokens` and
+  `output_tokens` stays 0. `confidence` itself is unchanged
+  (`max_probability_v1`), and a server without a table answers exactly as
+  before. `GET /v1/models` advertises the binding under `calibration` and
+  the new `calibrated_confidence`, `escalation_gate` and `permutation_probe`
+  capabilities. `--gate-config` overrides the thresholds.
+  `scripts/unridden/fit_calibration_table.py` fits a table from one model's
+  `observations.jsonl`.
+
 - A Tetris demo, `scripts/unridden/play_tetris.py`: Unridden picks every
   placement through `/v2` Choice questions, with heuristic and random
   baselines, a `--trace` JSONL log, and `tetris_replay.html` to step through a
