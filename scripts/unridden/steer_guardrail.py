@@ -10,8 +10,9 @@ instruction prepended to every question. Extraction and evaluation cases are
 disjoint, so the direction never sees the answers it is scored on.
 
 This drives the shared GPU through the running service. It does not launch
-anything; start the service via its systemd unit first, check
-`nvidia-smi memory.used`, and pass `--allow-gpu` to confirm that is intended:
+anything; start the service via its systemd unit first, run
+`gpu-policy check`, and pass `--allow-gpu` (only when it says GO) to confirm
+that is intended:
 
     .venv/bin/python scripts/unridden/steer_guardrail.py --allow-gpu \\
         --url http://127.0.0.1:18090 --out outputs/steer-guardrail.json
@@ -169,8 +170,8 @@ def run(args: argparse.Namespace) -> int:
     if not args.allow_gpu:
         print(
             "refused: this drives the shared GPU via the running service. "
-            "Check `systemctl --user list-unit-files | grep unridden` and "
-            "`nvidia-smi memory.used` first, then pass --allow-gpu.",
+            "Check `systemctl --user list-unit-files | grep unridden` and run "
+            "`gpu-policy check` first (GO = pass --allow-gpu).",
             file=sys.stderr,
         )
         return 2

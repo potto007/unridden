@@ -35,7 +35,7 @@ Unridden is a local, non-generative structured decision API backed by owned `lla
 ## 4. GPU, Native Worker, and Systemd Safety
 
 - **No Implicit GPU Allocation on Import or in Unit Tests:** Importing `unridden.*` or running `pytest` must never initialize CUDA or spawn a real model worker. All unit tests under `unridden/tests/` must run on CPU using deterministic fake backends.
-- **Explicit `--allow-gpu` / `--gpu` Guard:** Benchmark and validation scripts under `scripts/unridden/` require explicit confirmation and `--allow-gpu` (or `--gpu`). Check running `unridden-*.service` user systemd units and GPU memory (`nvidia-smi`) before starting a worker process; E4B (~5.1 GiB) and 26B-A4B (~18+ GiB) share the local 32 GiB GPU and must not be launched blindly in parallel.
+- **`--allow-gpu` / `--gpu` Guard:** Benchmark and validation scripts under `scripts/unridden/` keep `--allow-gpu` (or `--gpu`) as a deliberate-intent flag. Agents pass it when `gpu-policy check` says GO, and run long GPU jobs through `gpu-policy run --need <MiB> -- ...`. GPU use follows the machine-wide policy (~/.claude/CLAUDE.md, GPU section; local-ai ADR-0050): GO = no per-task ask; prod :8080/:8084 start/stop/swap still needs Paul's go-ahead. Check running `unridden-*.service` user systemd units before starting a worker process; E4B (~5.1 GiB) and 26B-A4B (~18+ GiB) share the local 32 GiB GPU and must not be launched blindly in parallel.
 - **Native Worker Logs:** `llama.cpp` worker stderr is routed to `/tmp/llama-server.log` (or the configured `native-worker.log`). Do not write project code or persistent artifacts to `/tmp`.
 
 ## 5. Verification Commands
