@@ -453,7 +453,7 @@ async def run(args: argparse.Namespace) -> None:
     # Importing the API must not initialize the GPU. Its lifespan owns the worker.
     from unridden.api.app import ApiConfig, create_app
 
-    assert args.allow_gpu, "Explicit --allow-gpu required"
+    assert args.allow_gpu, "--allow-gpu required: run `gpu-policy check` first"
     assert digest(args.cases) == FROZEN_CASES_SHA256, "Frozen fixture changed"
     fixtures = json.loads(args.cases.read_text())
     args.out.mkdir(parents=True, exist_ok=False)
@@ -1184,7 +1184,10 @@ def main() -> None:
     )
     args = parser.parse_args()
     if not args.allow_gpu:
-        parser.error("Explicit --allow-gpu is required")
+        parser.error(
+            "--allow-gpu is required: run `gpu-policy check` first "
+            "(GO = pass --allow-gpu)"
+        )
     asyncio.run(run(args))
 
 

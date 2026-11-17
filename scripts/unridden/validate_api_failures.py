@@ -177,7 +177,10 @@ def main() -> None:
     parser.add_argument("--allow-gpu", action="store_true")
     args = parser.parse_args()
     if not args.allow_gpu:
-        parser.error("Explicit --allow-gpu is required")
+        parser.error(
+            "--allow-gpu is required: run `gpu-policy check` first "
+            "(GO = pass --allow-gpu)"
+        )
     asyncio.run(run(args))
 
 
